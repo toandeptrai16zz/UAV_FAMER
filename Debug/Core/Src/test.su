@@ -1,0 +1,11 @@
+../Core/Src/test.c:70:13:log_async	16	static
+../Core/Src/test.c:87:13:sbus_decode_frame	24	static
+../Core/Src/test.c:99:13:sbus_parser_recover	16	static
+../Core/Src/test.c:110:13:sbus_feed_byte	16	static
+../Core/Src/test.c:122:13:sbus_service_receive_restart	8	static
+../Core/Src/test.c:129:6:HAL_UARTEx_RxEventCallback	24	static
+../Core/Src/test.c:136:6:HAL_UART_ErrorCallback	16	static
+../Core/Src/test.c:155:17:us_to_ccr	16	static
+../Core/Src/test.c:161:13:motor_step	80	static
+../Core/Src/test.c:260:6:uav_test_init	32	static
+../Core/Src/test.c:288:6:uav_test_loop	32	static
