@@ -1,4 +1,4 @@
-Core/Src/test.o: ../Core/Src/test.c ../Core/Inc/main.h \
+Core/Src/uav_test.o: ../Core/Src/uav_test.c ../Core/Inc/main.h \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal.h \
  ../Core/Inc/stm32g4xx_hal_conf.h \
  ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_rcc.h \

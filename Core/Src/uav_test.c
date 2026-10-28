@@ -212,6 +212,52 @@ static bool mpu6500_read_spi(void)
 
     return true;
 }
+#define GYRO_CAL_SAMPLES 1500u
+
+static int32_t gyro_bias_x_raw;
+static int32_t gyro_bias_y_raw;
+static int32_t gyro_bias_z_raw;
+
+static bool mpu6500_calibrate_gyro(void)
+{
+    int64_t sum_x = 0;
+    int64_t sum_y = 0;
+    int64_t sum_z = 0;
+    uint32_t valid_samples = 0;
+
+    /* Chờ cảm biến ổn định; board phải nằm yên. */
+    HAL_Delay(2000u);
+
+    for (uint32_t i = 0; i < GYRO_CAL_SAMPLES; i++) {
+        if (mpu6500_read_spi()) {
+            sum_x += gyro_x;
+            sum_y += gyro_y;
+            sum_z += gyro_z;
+            valid_samples++;
+        }
+
+        HAL_Delay(2u);
+    }
+
+    /* Không chấp nhận kết quả nếu mất quá 5% số mẫu. */
+    if (valid_samples < (GYRO_CAL_SAMPLES * 95u) / 100u) {
+        return false;
+    }
+
+    gyro_bias_x_raw = (int32_t)(sum_x / valid_samples);
+    gyro_bias_y_raw = (int32_t)(sum_y / valid_samples);
+    gyro_bias_z_raw = (int32_t)(sum_z / valid_samples);
+
+    log_async(
+        "GYRO_CAL bias_raw X=%ld Y=%ld Z=%ld n=%lu\r\n",
+        (long)gyro_bias_x_raw,
+        (long)gyro_bias_y_raw,
+        (long)gyro_bias_z_raw,
+        (unsigned long)valid_samples
+    );
+
+    return true;
+}
 
 /* ----------------------------- SBUS ----------------------------------- */
 static uint8_t sbus_rx_buffer[SBUS_RX_BUFFER_SIZE];
@@ -583,6 +629,11 @@ void uav_test_init(void)
     htim3.Instance->EGR = TIM_EGR_UG;
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 
+    if (imu_ready) {
+        if (!mpu6500_calibrate_gyro()) {
+            log_async("GYRO_CAL ERROR\r\n");
+        }
+    }
     /* Arm safety is switch-based; do not arm automatically on low throttle. */
     armed = false;
     arm_ready = false;
@@ -622,21 +673,24 @@ void uav_test_init(void)
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
     sbus_service_receive_restart();
 
+    /* Combine startup status into one transmission: log_async intentionally
+       refuses a second message while the previous interrupt TX is active. */
     if (imu_ready) {
-        log_async("IMU OK: MPU6500 WHO_AM_I=0x70\r\n");
+        log_async("IMU OK: MPU6500 WHO_AM_I=0x70 | READY: SBUS -> 4x PWM %u Hz\r\n",
+                  (unsigned)PWM_FREQ_HZ);
     } else {
-        log_async("IMU ERROR: check SPI2, CS PB12, power and wiring\r\n");
+        log_async("IMU ERROR: check SPI2/CS PB12/power/wiring | READY: PWM %u Hz\r\n",
+                  (unsigned)PWM_FREQ_HZ);
     }
-
-    log_async("READY: SBUS -> 4x PWM %u Hz; arm switch required; propellers off\r\n",
-              (unsigned)PWM_FREQ_HZ);
 }
 
 void uav_test_loop(void)
 {
     static uint32_t last_log_ms;
     static uint32_t last_imu_ms;
-    static uint32_t last_imu_log_ms;
+    /* Offset IMU logging from the 200-ms link log so the UART TX busy guard
+       does not drop every IMU line when both periods expire together. */
+    static uint32_t last_imu_log_ms = 500u;
     uint32_t now;
 
     sbus_service_receive_restart();

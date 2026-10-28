@@ -4,7 +4,7 @@
 "./Core/Src/syscalls.o"
 "./Core/Src/sysmem.o"
 "./Core/Src/system_stm32g4xx.o"
-"./Core/Src/test.o"
+"./Core/Src/uav_test.o"
 "./Core/Startup/startup_stm32g474retx.o"
 "./Drivers/BSP/STM32G4xx_Nucleo/stm32g4xx_nucleo.o"
 "./Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal.o"
