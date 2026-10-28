@@ -6,7 +6,6 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -15,12 +14,33 @@
 #include "uav_test.h"
 /* USER CODE END Includes */
 
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef hlpuart1;
 UART_HandleTypeDef huart1;
 
+SPI_HandleTypeDef hspi2;
+
 TIM_HandleTypeDef htim3;
 DMA_HandleTypeDef hdma_tim3_up;
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -29,6 +49,15 @@ static void MX_DMA_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_LPUART1_UART_Init(void);
+static void MX_SPI2_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
@@ -36,11 +65,25 @@ static void MX_LPUART1_UART_Init(void);
   */
 int main(void)
 {
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
   /* Configure the system clock */
   SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
@@ -48,15 +91,15 @@ int main(void)
   MX_TIM3_Init();
   MX_USART1_UART_Init();
   MX_LPUART1_UART_Init();
+  MX_SPI2_Init();
 
-  /* Stage 1: begin SBUS reception and log status over the ST-LINK Virtual COM. */
   /* USER CODE BEGIN 2 */
-  uav_test_init();
-  /* USER CODE END 2 */
-
-  /* Initialize led và nút bấm trên kit Nucleo */
+  /* Initialize board indicators before starting motor PWM outputs. */
   BSP_LED_Init(LED_GREEN);
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
+
+  uav_test_init();
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -65,7 +108,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Giải mã tín hiệu SBUS liên tục từ Tay điều khiển */
+    /* Process SBUS, update PWM outputs, and sample the MPU6500. */
     uav_test_loop();
   }
   /* USER CODE END 3 */
@@ -80,8 +123,13 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
+  /** Configure the main internal regulator output voltage
+  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -97,8 +145,9 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
@@ -110,6 +159,7 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 }
+
 /**
   * @brief LPUART1 Initialization Function (Cổng xuất Log ra máy tính)
   * @retval None
@@ -145,12 +195,11 @@ static void MX_LPUART1_UART_Init(void)
 }
 
 /**
-  * @brief USART1 Initialization Function (Ép cấu hình SBUS bảo vệ tuyệt đối)
+  * @brief USART1 initialization for SBUS receiver input
   * @retval None
   */
 static void MX_USART1_UART_Init(void)
 {
-  /* USER CODE BEGIN USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 100000;                       /* Tốc độ chuẩn SBUS */
   huart1.Init.WordLength = UART_WORDLENGTH_9B;         /* 9 bit gồm cả bit chẵn lẻ parity */
@@ -162,28 +211,52 @@ static void MX_USART1_UART_Init(void)
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
 
-  /* Cấu hình tự động đảo cực tín hiệu cho sBUS gốc */
+  /* SBUS is normally inverted; disable RX inversion if the receiver output is non-inverted. */
   huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_RXINVERT_INIT;
   huart1.AdvancedInit.RxPinLevelInvert = UART_ADVFEATURE_RXINV_ENABLE;
-
-  /* ÉP KHỞI CHẠY HÀM CHUYỂN CHÂN PB7 ĐỘC LẬP */
-  extern void MY_UART_MspInit_PB7(UART_HandleTypeDef* uartHandle);
-  MY_UART_MspInit_PB7(&huart1);
 
   if (HAL_UART_Init(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /* BẮT BUỘC KHÓA CHẾ ĐỘ FIFO ĐỂ CHIP KHÔNG CẮT LẺ GÓI TIN 1 BYTE */
+  /* Receive SBUS with explicit byte events; keep FIFO disabled for predictable RX handling. */
   if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE END USART1_Init 1 */
 }
+
 /**
-  * @brief TIM3 Initialization Function (Cấu hình chu kỳ 1132 cho Driver DShot)
+  * @brief SPI2 Initialization Function (Giao tiếp với MPU6500)
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_HIGH;
+  hspi2.Init.CLKPhase = SPI_PHASE_2EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  /* Keep SPI SCK below 1 MHz for conservative MPU6500 register access. */
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 7;
+  hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief TIM3 Initialization Function (Cấu hình chu kỳ cho Driver PWM)
   * @retval None
   */
 static void MX_TIM3_Init(void)
@@ -193,9 +266,11 @@ static void MX_TIM3_Init(void)
   TIM_OC_InitTypeDef sConfigOC = {0};
 
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
+  /* TIM3 counter = 170 MHz / (169 + 1) = 1 MHz.
+     Period = 2499 gives 400 Hz PWM (2500 us per frame). */
+  htim3.Init.Prescaler = 169;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 1132;                            /* Khớp thông số Driver DShot drone */
+  htim3.Init.Period = 2499;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -223,13 +298,17 @@ static void MX_TIM3_Init(void)
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
 
   /* Khởi tạo đồng loạt 4 kênh xuất xung ra 4 động cơ UAV */
-  HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1);
-  HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2);
-  HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3);
-  HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4);
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK ||
+      HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_2) != HAL_OK ||
+      HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_3) != HAL_OK ||
+      HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
 
   HAL_TIM_MspPostInit(&htim3);
 }
+
 /**
   * Enable DMA controller clock và cấu hình vector ngắt đầy đủ
   */
@@ -250,39 +329,29 @@ static void MX_DMA_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* Configure GPIO pin Output Level (Chân CS của IMU mức HIGH) */
+  HAL_GPIO_WritePin(IMU_GPIO_Port, IMU_Pin, GPIO_PIN_SET);
+
+  /* Configure GPIO pin : IMU_Pin (PB12) */
+  GPIO_InitStruct.Pin = IMU_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(IMU_GPIO_Port, &GPIO_InitStruct);
 }
 
-//* USER CODE BEGIN 4 */
-void MY_UART_MspInit_PB7(UART_HandleTypeDef* uartHandle)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  if(uartHandle->Instance==USART1)
-  {
-    __HAL_RCC_USART1_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-
-    /**USART1 GPIO Configuration
-    PB7     ------> USART1_RX
-    */
-    GPIO_InitStruct.Pin = GPIO_PIN_7;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH; /* Đẩy tốc độ phản hồi chân lên tối đa */
-    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-    /* ÉP MỨC ƯU TIÊN NGẮT LÊN CAO NHẤT (MỨC 0) ĐỂ KHÔNG BỊ HỤT BYTE */
-    HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
-    HAL_NVIC_EnableIRQ(USART1_IRQn);
-  }
-}
+/* USER CODE BEGIN 4 */
 /* USER CODE END 4 */
 
-/* USER CODE END 4 */
+
 
 /**
   * @brief  Trình xử lý dừng hệ thống khi xảy ra sự cố nghiêm trọng.
@@ -302,4 +371,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   (void)line;
 }
 #endif /* USE_FULL_ASSERT */
-

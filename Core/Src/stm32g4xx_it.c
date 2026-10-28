@@ -55,6 +55,7 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
+extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef hlpuart1;
 extern DMA_HandleTypeDef hdma_tim3_up;
 extern TIM_HandleTypeDef htim3;
@@ -243,7 +244,15 @@ void EXTI15_10_IRQHandler(void)
 }
 
 /**
-  * @brief This function handles LPUART1 global interrupt.
+  * @brief This function handles USART1 global interrupt (SBUS RX).
+  */
+void USART1_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart1);
+}
+
+/**
+  * @brief This function handles LPUART1 global interrupt (serial log).
   */
 void LPUART1_IRQHandler(void)
 {
@@ -254,11 +263,6 @@ void LPUART1_IRQHandler(void)
   /* USER CODE BEGIN LPUART1_IRQn 1 */
 
   /* USER CODE END LPUART1_IRQn 1 */
-}
-extern UART_HandleTypeDef huart1;
-void USART1_IRQHandler(void)
-{
-  HAL_UART_IRQHandler(&huart1);
 }
 
 /* USER CODE BEGIN 1 */
