@@ -87,7 +87,7 @@ extern DMA_HandleTypeDef hdma_tim3_up;
  * Keep attitude PID disabled for the first motor/ESC bench verification.
  * Set to 1 only after IMU axes, motor order/directions and gains are verified.
  */
-#define ENABLE_ATTITUDE_PID          0u
+#define ENABLE_ATTITUDE_PID          1u
 #define PID_ANGLE_LIMIT_DEG          25.0f
 #define PID_KP_ROLL                  8.0f   /* DShot counts per degree */
 #define PID_KI_ROLL                  0.0f

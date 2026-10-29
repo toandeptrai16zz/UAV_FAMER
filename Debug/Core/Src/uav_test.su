@@ -10,6 +10,8 @@
 ../Core/Src/uav_test.c:256:14:gyro_x_rate_dps	4	static
 ../Core/Src/uav_test.c:261:14:gyro_y_rate_dps	4	static
 ../Core/Src/uav_test.c:266:13:update_attitude	40	static
+../Core/Src/uav_test.c:286:14:clampf_local	24	static
+../Core/Src/uav_test.c:293:14:stick_to_angle_deg	24	static
 ../Core/Src/uav_test.c:319:13:sbus_footer_valid	16	static
 ../Core/Src/uav_test.c:323:13:sbus_decode_frame	24	static
 ../Core/Src/uav_test.c:335:13:sbus_parser_recover	16	static
@@ -23,6 +25,6 @@
 ../Core/Src/uav_test.c:452:13:outputs_force_zero	16	static
 ../Core/Src/uav_test.c:458:13:sbus_snapshot	40	static,ignoring_inline_asm
 ../Core/Src/uav_test.c:473:13:throttle_calibration_valid	4	static
-../Core/Src/uav_test.c:479:13:motor_step	160	static
+../Core/Src/uav_test.c:479:13:motor_step	200	static
 ../Core/Src/uav_test.c:677:6:uav_test_init	8	static
 ../Core/Src/uav_test.c:737:6:uav_test_loop	192	static
