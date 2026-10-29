@@ -1,6 +1,13 @@
 /*
  * uav_test.c
- * SBUS receiver -> 4-channel PWM 400Hz + MPU6500 SPI + PID Control (Quad-X)
+ * SBUS receiver -> four-channel DShot300 output using TIM3 DMA-burst,
+ * plus MPU6500 SPI readout.
+ *
+ * SAFETY:
+ * - Remove all propellers during bench tests.
+ * - CH_THR / CH_ARM / CH_KILL are zero-based SBUS channel indexes.
+ * - Verify SBUS channel mapping, switch polarity, ESC DShot support and wiring.
+ * - This implementation is unidirectional DShot300 (no telemetry / bidirectional DShot).
  */
 
 #include "main.h"
@@ -12,24 +19,29 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
-#include <math.h> // Thêm thư viện toán học cho atan2f, sqrtf
 
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef hlpuart1;
 extern TIM_HandleTypeDef htim3;
 extern SPI_HandleTypeDef hspi2;
+extern DMA_HandleTypeDef hdma_tim3_up;
 
-/* ----------------------------- PWM config ----------------------------- */
-#define PWM_FREQ_HZ                 400u
-#define TIM3_CLK_HZ                 170000000u
-#define PWM_TICK_HZ                 1000000u
-#define PWM_MIN_US                  1000.0f
-#define PWM_MAX_US                  1900.0f
+/* ---------------------------- DShot config ---------------------------- */
+#define DSHOT_TIMER_PERIOD_TICKS    567u  /* 170 MHz / 567 ~= 299.8 kbit/s */
+#define DSHOT_T0H_TICKS             213u  /* ~= 1.25 us */
+#define DSHOT_T1H_TICKS             425u  /* ~= 2.50 us */
+#define DSHOT_PACKET_BITS           16u
+#define DSHOT_TRAILING_CELLS        1u
+#define DSHOT_DMA_CELLS             (DSHOT_PACKET_BITS + DSHOT_TRAILING_CELLS)
+#define DSHOT_CONTROL_PERIOD_MS     1u
+#define DSHOT_THROTTLE_MIN          48u
+#define DSHOT_THROTTLE_MAX          2047u
 #define PWM_OUTPUT_COUNT            4u
 #define TEST_MOTOR_MASK             0x0Fu
 
+/* Increase from zero equally on all motors. Tune only after bench validation. */
 #define THR_FILTER_ALPHA            0.30f
-#define SLEW_UP_RATIO_PER_S         5.0f
+#define SLEW_UP_RATIO_PER_S          5.0f
 
 /* ----------------------------- SBUS config ---------------------------- */
 #define SBUS_FRAME_SIZE             25u
@@ -39,10 +51,12 @@ extern SPI_HandleTypeDef hspi2;
 #define SBUS_FLAG_FRAME_LOST        0x04u
 #define SBUS_FLAG_FAILSAFE          0x08u
 
+/* Preserve the input calibration from the supplied source. Adjust to measured endpoints. */
 #define SBUS_MIN                    8u
 #define SBUS_MAX                    1606u
 #define SBUS_MID                    ((SBUS_MIN + SBUS_MAX) / 2u)
 
+/* Zero-based channel indexes: index 2 = receiver channel 3, etc. */
 #define CH_THR                      2u
 #define CH_ARM                      4u
 #define CH_KILL                     5u
@@ -58,30 +72,37 @@ extern SPI_HandleTypeDef hspi2;
 #define ARM_LOW_HOLD_MS             500u
 #define LINK_STABLE_MS              1000u
 #define LOG_PERIOD_MS               200u
-#define IMU_SAMPLE_PERIOD_MS        1u
+#define IMU_SAMPLE_PERIOD_MS        2u
 #define SPI_TIMEOUT_MS              5u
-
-/* ----------------------------- PID & IMU Config ----------------------- */
-// Bộ lọc bù (Complementary Filter) - Alpha càng cao thì tin tưởng Gyro hơn
-#define COMP_FILTER_ALPHA           0.98f
-
-// Hệ số PID (Sẽ tinh chỉnh trên MATLAB)
-#define PID_KP_ROLL                 1.5f
-#define PID_KI_ROLL                 0.05f
-#define PID_KD_ROLL                 0.8f
-
-#define PID_KP_PITCH                1.5f
-#define PID_KI_PITCH                0.05f
-#define PID_KD_PITCH                0.8f
-
-// Giới hạn tích phân (Anti-windup)
-#define PID_I_LIMIT                 200.0f
-
-#define GYRO_MDPS(raw_minus_bias)   (((int32_t)(raw_minus_bias) * 2000) / 131)
-#define ACCEL_MG(raw)               (((int32_t)(raw) * 125) / 1024)
 
 #define CS_LOW()  HAL_GPIO_WritePin(IMU_GPIO_Port, IMU_Pin, GPIO_PIN_RESET)
 #define CS_HIGH() HAL_GPIO_WritePin(IMU_GPIO_Port, IMU_Pin, GPIO_PIN_SET)
+
+/* --------------------------- DShot DMA state -------------------------- */
+/* Timer DMA-burst buffer is row-major: [DShot bit][CCR1..CCR4]. One TIM3_UP
+ * event produces a four-transfer DMA burst that updates all channels together.
+ * The final row contains zeros, returning all pins to idle-low. */
+static uint16_t dshot_dma_buffer[DSHOT_DMA_CELLS][PWM_OUTPUT_COUNT];
+static volatile uint32_t dshot_tx_errors;
+static volatile uint32_t dshot_tx_done;
+static volatile uint8_t dshot_dma_error_pending;
+
+static void dshot_dma_tx_complete(DMA_HandleTypeDef *hdma)
+{
+    (void)hdma;
+    /* Stop update requests immediately after the final burst so there is no
+     * DMA overrun while the zero tail is latched on the next timer update. */
+    __HAL_TIM_DISABLE_DMA(&htim3, TIM_DMA_UPDATE);
+    dshot_tx_done++;
+}
+
+static void dshot_dma_tx_error(DMA_HandleTypeDef *hdma)
+{
+    (void)hdma;
+    __HAL_TIM_DISABLE_DMA(&htim3, TIM_DMA_UPDATE);
+    dshot_tx_errors++;
+    dshot_dma_error_pending = 1u;
+}
 
 /* ----------------------------- Logging -------------------------------- */
 static char log_buffer[256];
@@ -92,16 +113,23 @@ static void log_async(const char *fmt, ...)
     size_t tx_len;
     va_list ap;
 
-    if (hlpuart1.gState != HAL_UART_STATE_READY) return;
+    if (hlpuart1.gState != HAL_UART_STATE_READY) {
+        return;
+    }
 
     va_start(ap, fmt);
     n = vsnprintf(log_buffer, sizeof(log_buffer), fmt, ap);
     va_end(ap);
 
-    if (n <= 0) return;
+    if (n <= 0) {
+        return;
+    }
 
+    /* vsnprintf returns the length that would have been written; clamp it. */
     tx_len = (size_t)n;
-    if (tx_len >= sizeof(log_buffer)) tx_len = sizeof(log_buffer) - 1u;
+    if (tx_len >= sizeof(log_buffer)) {
+        tx_len = sizeof(log_buffer) - 1u;
+    }
 
     (void)HAL_UART_Transmit_IT(&hlpuart1, (uint8_t *)log_buffer, (uint16_t)tx_len);
 }
@@ -110,13 +138,13 @@ static void log_async(const char *fmt, ...)
 static int16_t accel_x, accel_y, accel_z;
 static int16_t gyro_x, gyro_y, gyro_z;
 static bool imu_ready;
-static bool gyro_cal_ok;
 static uint32_t imu_read_errors;
 
 static HAL_StatusTypeDef mpu_write_reg(uint8_t reg, uint8_t value)
 {
     uint8_t tx[2] = {(uint8_t)(reg & 0x7Fu), value};
     HAL_StatusTypeDef status;
+
     CS_LOW();
     status = HAL_SPI_Transmit(&hspi2, tx, sizeof(tx), SPI_TIMEOUT_MS);
     CS_HIGH();
@@ -128,55 +156,71 @@ static HAL_StatusTypeDef mpu_read_reg(uint8_t reg, uint8_t *value)
     uint8_t tx[2] = {(uint8_t)(reg | 0x80u), 0x00u};
     uint8_t rx[2] = {0u, 0u};
     HAL_StatusTypeDef status;
-    if (value == NULL) return HAL_ERROR;
+
+    if (value == NULL) {
+        return HAL_ERROR;
+    }
 
     CS_LOW();
     status = HAL_SPI_TransmitReceive(&hspi2, tx, rx, sizeof(tx), SPI_TIMEOUT_MS);
     CS_HIGH();
-    if (status == HAL_OK) *value = rx[1];
+
+    if (status == HAL_OK) {
+        *value = rx[1];
+    }
     return status;
 }
 
 static HAL_StatusTypeDef mpu_read_regs(uint8_t reg, uint8_t *buffer, uint16_t len)
 {
-    uint8_t tx[15] = {0};
-    uint8_t rx[15] = {0};
+    uint8_t tx_reg = (uint8_t)(reg | 0x80u);
     HAL_StatusTypeDef status;
-    if ((buffer == NULL) || (len == 0u) || (len > 14u)) return HAL_ERROR;
 
-    tx[0] = (uint8_t)(reg | 0x80u);
+    if ((buffer == NULL) || (len == 0u)) {
+        return HAL_ERROR;
+    }
+
     CS_LOW();
-    status = HAL_SPI_TransmitReceive(&hspi2, tx, rx, (uint16_t)(len + 1u), SPI_TIMEOUT_MS);
+    status = HAL_SPI_Transmit(&hspi2, &tx_reg, 1u, SPI_TIMEOUT_MS);
+    if (status == HAL_OK) {
+        status = HAL_SPI_Receive(&hspi2, buffer, len, SPI_TIMEOUT_MS);
+    }
     CS_HIGH();
-    if (status == HAL_OK) memcpy(buffer, &rx[1], len);
     return status;
 }
 
 static bool mpu6500_init_spi(void)
 {
     uint8_t who_am_i = 0u;
+
     CS_HIGH();
     HAL_Delay(10u);
 
-    if (mpu_read_reg(0x75u, &who_am_i) != HAL_OK) return false;
-    if (who_am_i != 0x70u) {
-        log_async("IMU ERROR: WHO_AM_I=0x%02X\r\n", who_am_i);
+    if (mpu_read_reg(0x75u, &who_am_i) != HAL_OK) {
         return false;
     }
 
-    mpu_write_reg(0x6Bu, 0x80u); HAL_Delay(100u); // Reset
-    mpu_write_reg(0x6Au, 0x11u); HAL_Delay(100u); // SPI Mode
+    /* MPU-6500 WHO_AM_I is 0x70. Do not silently accept a different device. */
+    if (who_am_i != 0x70u) {
+        log_async("IMU ERROR: WHO_AM_I=0x%02X, expected 0x70\r\n", who_am_i);
+        return false;
+    }
 
-    if ((mpu_write_reg(0x6Bu, 0x01u) != HAL_OK) || // PLL, wake up
-        (mpu_write_reg(0x6Cu, 0x00u) != HAL_OK) || // Accel+Gyro enable
-        (mpu_write_reg(0x19u, 0x00u) != HAL_OK) || // 1kHz ODR
-        (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) || // DLPF 41Hz
-        (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) || // Gyro +/-500dps
-        (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK) || // Accel +/-4g
-        (mpu_write_reg(0x1Du, 0x03u) != HAL_OK))
+    if (mpu_write_reg(0x6Bu, 0x80u) != HAL_OK) { /* Device reset */
+        return false;
+    }
+    HAL_Delay(100u);
+
+    /* Use the X-gyro PLL clock, 1 kHz output base when DLPF is enabled. */
+    if ((mpu_write_reg(0x6Bu, 0x01u) != HAL_OK) ||
+        (mpu_write_reg(0x19u, 0x01u) != HAL_OK) || /* Sample-rate divider */
+        (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) || /* DLPF */
+        (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) || /* Gyro +/- 500 dps */
+        (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK))  /* Accel +/- 4 g */
     {
         return false;
     }
+
     HAL_Delay(10u);
     return true;
 }
@@ -184,6 +228,7 @@ static bool mpu6500_init_spi(void)
 static bool mpu6500_read_spi(void)
 {
     uint8_t buffer[14];
+
     if (mpu_read_regs(0x3Bu, buffer, sizeof(buffer)) != HAL_OK) {
         imu_read_errors++;
         return false;
@@ -192,75 +237,58 @@ static bool mpu6500_read_spi(void)
     accel_x = (int16_t)(((uint16_t)buffer[0] << 8) | buffer[1]);
     accel_y = (int16_t)(((uint16_t)buffer[2] << 8) | buffer[3]);
     accel_z = (int16_t)(((uint16_t)buffer[4] << 8) | buffer[5]);
+    /* buffer[6..7] contains temperature. */
     gyro_x  = (int16_t)(((uint16_t)buffer[8]  << 8) | buffer[9]);
     gyro_y  = (int16_t)(((uint16_t)buffer[10] << 8) | buffer[11]);
     gyro_z  = (int16_t)(((uint16_t)buffer[12] << 8) | buffer[13]);
 
     return true;
 }
-
 #define GYRO_CAL_SAMPLES 1500u
-static int32_t gyro_bias_x_raw, gyro_bias_y_raw, gyro_bias_z_raw;
-#define GYRO_CAL_MAX_SPREAD_RAW 300
+
+static int32_t gyro_bias_x_raw;
+static int32_t gyro_bias_y_raw;
+static int32_t gyro_bias_z_raw;
 
 static bool mpu6500_calibrate_gyro(void)
 {
-    int64_t sum[3] = {0, 0, 0};
-    int16_t vmin[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
-    int16_t vmax[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
+    int64_t sum_x = 0;
+    int64_t sum_y = 0;
+    int64_t sum_z = 0;
     uint32_t valid_samples = 0;
-    uint8_t a;
 
-    HAL_Delay(1000u); // Đợi board đứng yên
+    /* Chờ cảm biến ổn định; board phải nằm yên. */
+    HAL_Delay(2000u);
 
     for (uint32_t i = 0; i < GYRO_CAL_SAMPLES; i++) {
         if (mpu6500_read_spi()) {
-            int16_t v[3] = {gyro_x, gyro_y, gyro_z};
-            for (a = 0u; a < 3u; a++) {
-                sum[a] += v[a];
-                if (v[a] < vmin[a]) vmin[a] = v[a];
-                if (v[a] > vmax[a]) vmax[a] = v[a];
-            }
+            sum_x += gyro_x;
+            sum_y += gyro_y;
+            sum_z += gyro_z;
             valid_samples++;
         }
+
         HAL_Delay(2u);
     }
 
-    if (valid_samples < (GYRO_CAL_SAMPLES * 95u) / 100u) return false;
-    for (a = 0u; a < 3u; a++) {
-        if ((vmax[a] - vmin[a]) > GYRO_CAL_MAX_SPREAD_RAW) return false;
+    /* Không chấp nhận kết quả nếu mất quá 5% số mẫu. */
+    if (valid_samples < (GYRO_CAL_SAMPLES * 95u) / 100u) {
+        return false;
     }
 
-    gyro_bias_x_raw = (int32_t)(sum[0] / valid_samples);
-    gyro_bias_y_raw = (int32_t)(sum[1] / valid_samples);
-    gyro_bias_z_raw = (int32_t)(sum[2] / valid_samples);
+    gyro_bias_x_raw = (int32_t)(sum_x / valid_samples);
+    gyro_bias_y_raw = (int32_t)(sum_y / valid_samples);
+    gyro_bias_z_raw = (int32_t)(sum_z / valid_samples);
+
+    log_async(
+        "GYRO_CAL bias_raw X=%ld Y=%ld Z=%ld n=%lu\r\n",
+        (long)gyro_bias_x_raw,
+        (long)gyro_bias_y_raw,
+        (long)gyro_bias_z_raw,
+        (unsigned long)valid_samples
+    );
+
     return true;
-}
-
-/* ----------------------------- PID Variables -------------------------- */
-static float roll_angle = 0.0f;
-static float pitch_angle = 0.0f;
-static float roll_integral = 0.0f;
-static float pitch_integral = 0.0f;
-static uint32_t last_pid_ms = 0;
-
-/* Hàm tính góc nghiêng bằng Complementary Filter */
-static void update_attitude(uint32_t dt_ms) {
-    float dt = (float)dt_ms / 1000.0f;
-    if (dt <= 0.0f) return;
-
-    // 1. Tính góc từ Gia tốc kế (Accelerometer)
-    float accel_roll  = atan2f((float)accel_y, (float)accel_z) * 57.2958f;
-    float accel_pitch = atan2f(-(float)accel_x, sqrtf((float)accel_y*(float)accel_y + (float)accel_z*(float)accel_z)) * 57.2958f;
-
-    // 2. Tính góc từ Con quay hồi chuyển (Gyroscope)
-    // Đã trừ đi bias và chuyển sang độ/giây (dps)
-    float gyro_roll_rate  = (float)(GYRO_MDPS(gyro_x - gyro_bias_x_raw)) / 1000.0f;
-    float gyro_pitch_rate = (float)(GYRO_MDPS(gyro_y - gyro_bias_y_raw)) / 1000.0f;
-
-    // 3. Bộ lọc bù (Complementary Filter)
-    roll_angle  = COMP_FILTER_ALPHA * (roll_angle + gyro_roll_rate * dt) + (1.0f - COMP_FILTER_ALPHA) * accel_roll;
-    pitch_angle = COMP_FILTER_ALPHA * (pitch_angle + gyro_pitch_rate * dt) + (1.0f - COMP_FILTER_ALPHA) * accel_pitch;
 }
 
 /* ----------------------------- SBUS ----------------------------------- */
@@ -275,8 +303,13 @@ static volatile uint32_t sbus_uart_errors;
 static volatile uint32_t sbus_last_valid_ms;
 static volatile uint8_t sbus_rx_rearm_pending = 1u;
 
-static bool sbus_footer_valid(uint8_t footer) {
-    return (footer == 0x00u) || (footer == 0x08u) || ((footer & 0x0Fu) == 0x04u);
+static bool sbus_footer_valid(uint8_t footer)
+{
+    /* SBUS1: 0x00; common SBUS2 footers: 0x04, 0x14, 0x24, 0x34.
+       Some SBUS2/12-channel receivers use 0x08. */
+    return (footer == 0x00u) ||
+           (footer == 0x08u) ||
+           ((footer & 0x0Fu) == 0x04u);
 }
 
 static void sbus_decode_frame(const uint8_t frame[SBUS_FRAME_SIZE])
@@ -284,7 +317,9 @@ static void sbus_decode_frame(const uint8_t frame[SBUS_FRAME_SIZE])
     uint32_t accumulator = 0u;
     uint8_t available_bits = 0u;
     uint8_t index = 1u;
-    for (uint8_t channel = 0u; channel < 16u; ++channel) {
+    uint8_t channel;
+
+    for (channel = 0u; channel < 16u; ++channel) {
         while (available_bits < 11u) {
             accumulator |= ((uint32_t)frame[index++]) << available_bits;
             available_bits = (uint8_t)(available_bits + 8u);
@@ -293,6 +328,7 @@ static void sbus_decode_frame(const uint8_t frame[SBUS_FRAME_SIZE])
         accumulator >>= 11;
         available_bits = (uint8_t)(available_bits - 11u);
     }
+
     sbus_flags = frame[23];
     sbus_last_valid_ms = HAL_GetTick();
     sbus_frames_ok++;
@@ -300,7 +336,9 @@ static void sbus_decode_frame(const uint8_t frame[SBUS_FRAME_SIZE])
 
 static void sbus_parser_recover(void)
 {
-    for (uint8_t i = 1u; i < SBUS_FRAME_SIZE; ++i) {
+    uint8_t i;
+
+    for (i = 1u; i < SBUS_FRAME_SIZE; ++i) {
         if (sbus_frame[i] == SBUS_START_BYTE) {
             uint8_t remaining = (uint8_t)(SBUS_FRAME_SIZE - i);
             memmove(sbus_frame, &sbus_frame[i], remaining);
@@ -308,6 +346,7 @@ static void sbus_parser_recover(void)
             return;
         }
     }
+
     sbus_frame_pos = 0u;
 }
 
@@ -320,6 +359,7 @@ static void sbus_feed_byte(uint8_t byte)
         }
         return;
     }
+
     sbus_frame[sbus_frame_pos++] = byte;
     if (sbus_frame_pos >= SBUS_FRAME_SIZE) {
         if ((sbus_frame[0] == SBUS_START_BYTE) && sbus_footer_valid(sbus_frame[24])) {
@@ -334,25 +374,49 @@ static void sbus_feed_byte(uint8_t byte)
 
 static void sbus_service_receive_restart(void)
 {
-    if (sbus_rx_rearm_pending == 0u || huart1.RxState != HAL_UART_STATE_READY) return;
+    if (sbus_rx_rearm_pending == 0u) {
+        return;
+    }
+    if (huart1.RxState != HAL_UART_STATE_READY) {
+        return;
+    }
 
-    __HAL_UART_CLEAR_FLAG(&huart1, UART_CLEAR_PEF | UART_CLEAR_FEF | UART_CLEAR_NEF | UART_CLEAR_OREF);
-    if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, sbus_rx_buffer, sizeof(sbus_rx_buffer)) == HAL_OK) {
+    __HAL_UART_CLEAR_FLAG(&huart1,
+                          UART_CLEAR_PEF | UART_CLEAR_FEF |
+                          UART_CLEAR_NEF | UART_CLEAR_OREF);
+
+    if (HAL_UARTEx_ReceiveToIdle_IT(&huart1, sbus_rx_buffer,
+                                    sizeof(sbus_rx_buffer)) == HAL_OK) {
         sbus_rx_rearm_pending = 0u;
     }
 }
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
 {
-    if (huart != &huart1) return;
-    if (size > sizeof(sbus_rx_buffer)) size = sizeof(sbus_rx_buffer);
-    for (uint16_t i = 0u; i < size; ++i) sbus_feed_byte(sbus_rx_buffer[i]);
+    uint16_t i;
+
+    if (huart != &huart1) {
+        return;
+    }
+
+    if (size > sizeof(sbus_rx_buffer)) {
+        size = sizeof(sbus_rx_buffer);
+    }
+
+    for (i = 0u; i < size; ++i) {
+        sbus_feed_byte(sbus_rx_buffer[i]);
+    }
+
+    /* ReceiveToIdle_IT ends this transaction; restart it in the main loop. */
     sbus_rx_rearm_pending = 1u;
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    if (huart != &huart1) return;
+    if (huart != &huart1) {
+        return;
+    }
+
     sbus_uart_errors++;
     sbus_frame_pos = 0u;
     sbus_rx_rearm_pending = 1u;
@@ -373,65 +437,190 @@ static uint16_t win_max;
 static uint16_t throttle_zero;
 static float throttle_filtered;
 static float throttle_ratio;
-static float output_us[PWM_OUTPUT_COUNT] = {PWM_MIN_US, PWM_MIN_US, PWM_MIN_US, PWM_MIN_US};
-
-// Debug variables
-static uint32_t debug_age_ms, debug_frames_ok, debug_frames_bad, debug_uart_errors;
+static uint32_t debug_age_ms;
+static uint32_t debug_frames_ok;
+static uint32_t debug_frames_bad;
+static uint32_t debug_uart_errors;
 static bool debug_link_ok;
-static uint16_t debug_throttle, debug_arm, debug_kill;
+static uint16_t debug_throttle;
+static uint16_t debug_arm;
+static uint16_t debug_kill;
+static uint16_t output_dshot[PWM_OUTPUT_COUNT] = {0u, 0u, 0u, 0u};
 
-static uint32_t pulse_us_to_ccr(float pulse_us) {
-    if (pulse_us < PWM_MIN_US) pulse_us = PWM_MIN_US;
-    else if (pulse_us > PWM_MAX_US) pulse_us = PWM_MAX_US;
-    return (uint32_t)(pulse_us + 0.5f);
+/* Only force the timer compare registers low. Do not modify output_dshot here:
+ * it is also the source command array and is displayed in the diagnostic log. */
+static void dshot_set_compare_zero(void)
+{
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0u);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0u);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, 0u);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, 0u);
 }
 
-static void sbus_snapshot(uint32_t *frames_ok, uint32_t *last_valid_ms, uint32_t *frames_bad,
-                          uint32_t *uart_errors, uint8_t *flags, uint16_t channels[16])
+static void dshot_clear_command(void)
+{
+    uint8_t i;
+
+    for (i = 0u; i < PWM_OUTPUT_COUNT; ++i) {
+        output_dshot[i] = 0u;
+    }
+    dshot_set_compare_zero();
+}
+
+static uint16_t dshot_make_packet(uint16_t value)
+{
+    uint16_t payload;
+    uint16_t checksum;
+
+    /* Standard unidirectional DShot: 11-bit value, telemetry bit 0, CRC4.
+     * Only bidirectional/inverted DShot complements this checksum. */
+    payload = (uint16_t)((value & 0x07FFu) << 1);
+    checksum = (uint16_t)((payload ^ (payload >> 4) ^ (payload >> 8)) & 0x0Fu);
+    return (uint16_t)((payload << 4) | checksum);
+}
+
+static void dshot_prepare_buffer(const uint16_t command[PWM_OUTPUT_COUNT])
+{
+    uint16_t packet[PWM_OUTPUT_COUNT];
+    uint8_t motor;
+    uint8_t bit;
+
+    for (motor = 0u; motor < PWM_OUTPUT_COUNT; ++motor) {
+        packet[motor] = dshot_make_packet(command[motor]);
+    }
+
+    /* DShot transmits MSB first. One row corresponds to one bit period; timer
+     * DMA burst routes its four halfwords to CCR1, CCR2, CCR3 and CCR4. */
+    for (bit = 0u; bit < DSHOT_PACKET_BITS; ++bit) {
+        for (motor = 0u; motor < PWM_OUTPUT_COUNT; ++motor) {
+            const uint8_t set = (uint8_t)((packet[motor] >> (15u - bit)) & 1u);
+            dshot_dma_buffer[bit][motor] = set ? DSHOT_T1H_TICKS : DSHOT_T0H_TICKS;
+        }
+    }
+
+    /* One tail row is enough: it is written to CCR preload after bit 0 and
+     * becomes active on the following update, leaving the outputs low. */
+    for (motor = 0u; motor < PWM_OUTPUT_COUNT; ++motor) {
+        dshot_dma_buffer[DSHOT_PACKET_BITS][motor] = 0u;
+    }
+}
+
+static bool dshot_send_all(const uint16_t command[PWM_OUTPUT_COUNT])
+{
+    DMA_HandleTypeDef *dma = &hdma_tim3_up;
+    uint32_t transfer_count = DSHOT_DMA_CELLS * PWM_OUTPUT_COUNT;
+
+    /* A frame should finish in roughly 57 us. At the 1 kHz control rate the
+     * single DMA stream must already be READY before another packet is sent. */
+    if (HAL_DMA_GetState(dma) != HAL_DMA_STATE_READY) {
+        __HAL_TIM_DISABLE_DMA(&htim3, TIM_DMA_UPDATE);
+        (void)HAL_DMA_Abort(dma);
+        dshot_clear_command();
+        dshot_tx_errors++;
+        return false;
+    }
+
+    __HAL_TIM_DISABLE_DMA(&htim3, TIM_DMA_UPDATE);
+    dshot_prepare_buffer(command);
+
+    /* Ensure an idle-low start. This only clears the CCR preload values; keep
+     * the command array intact so the DSHOT=... log reports what we requested. */
+    dshot_set_compare_zero();
+
+    dma->XferCpltCallback = dshot_dma_tx_complete;
+    dma->XferErrorCallback = dshot_dma_tx_error;
+
+    if (HAL_DMA_Start_IT(dma,
+                         (uint32_t)(uintptr_t)&dshot_dma_buffer[0][0],
+                         (uint32_t)(uintptr_t)&htim3.Instance->DMAR,
+                         transfer_count) != HAL_OK) {
+        __HAL_TIM_DISABLE_DMA(&htim3, TIM_DMA_UPDATE);
+        (void)HAL_DMA_Abort(dma);
+        dshot_clear_command();
+        dshot_tx_errors++;
+        return false;
+    }
+
+    /* TIM3_DCR is configured for a 4-transfer burst starting at CCR1. */
+    __HAL_TIM_ENABLE_DMA(&htim3, TIM_DMA_UPDATE);
+    return true;
+}
+
+static void sbus_snapshot(uint32_t *frames_ok,
+                          uint32_t *last_valid_ms,
+                          uint32_t *frames_bad,
+                          uint32_t *uart_errors,
+                          uint8_t *flags,
+                          uint16_t channels[16])
 {
     uint32_t primask = __get_PRIMASK();
+    uint8_t i;
+
     __disable_irq();
     *frames_ok = sbus_frames_ok;
     *last_valid_ms = sbus_last_valid_ms;
     *frames_bad = sbus_frames_bad;
     *uart_errors = sbus_uart_errors;
     *flags = sbus_flags;
-    for (uint8_t i = 0u; i < 16u; ++i) channels[i] = sbus_channels[i];
-    if (primask == 0u) __enable_irq();
-}
-
-static void set_all_motor_pulses(float pulse_us) {
-    uint32_t ccr = pulse_us_to_ccr(pulse_us);
-    for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) output_us[i] = (float)ccr;
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ccr);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ccr);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, ccr);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, ccr);
+    for (i = 0u; i < 16u; ++i) {
+        channels[i] = sbus_channels[i];
+    }
+    if (primask == 0u) {
+        __enable_irq();
+    }
 }
 
 static void motor_step(void)
 {
     uint32_t now = HAL_GetTick();
     uint32_t elapsed = now - boot_ms;
-    uint32_t frames_ok, last_valid_ms, frames_bad, uart_errors, age_ms;
+    uint32_t frames_ok;
+    uint32_t last_valid_ms;
+    uint32_t frames_bad;
+    uint32_t uart_errors;
+    uint32_t age_ms;
     uint8_t flags;
     uint16_t channels[16];
-    uint16_t ch_thr, ch_arm, ch_kill;
-    bool link_ok, link_stable, throttle_low, stick_stable_low, arm_switch_on, kill_switch_on;
-    float threshold, denominator, target_ratio = 0.0f, step_up = SLEW_UP_RATIO_PER_S / (float)PWM_FREQ_HZ;
-    float pulse_us;
+    uint16_t ch_thr;
+    uint16_t ch_arm;
+    uint16_t ch_kill;
+    bool link_ok;
+    bool link_stable;
+    bool throttle_low;
+    bool stick_stable_low;
+    bool arm_switch_on;
+    bool kill_switch_on;
+    float threshold;
+    float denominator;
+    float target_ratio = 0.0f;
+    float step_up = SLEW_UP_RATIO_PER_S / (1000.0f / (float)DSHOT_CONTROL_PERIOD_MS);
+    uint8_t i;
 
-    sbus_snapshot(&frames_ok, &last_valid_ms, &frames_bad, &uart_errors, &flags, channels);
+    sbus_snapshot(&frames_ok, &last_valid_ms, &frames_bad,
+                  &uart_errors, &flags, channels);
+
+    /* A DMA transfer can fail asynchronously after dshot_send_all() returns. */
+    if (dshot_dma_error_pending != 0u) {
+        dshot_dma_error_pending = 0u;
+        armed = false;
+        arm_ready = false;
+        spinning = false;
+        throttle_ratio = 0.0f;
+        dshot_clear_command();
+    }
 
     ch_thr = channels[CH_THR];
     ch_arm = channels[CH_ARM];
     ch_kill = channels[CH_KILL];
     age_ms = now - last_valid_ms;
 
+    /* Stop on stale data, receiver failsafe, or a reported lost frame. */
     link_ok = (frames_ok > 0u) && (age_ms < SBUS_LINK_TIMEOUT_MS) &&
               ((flags & (SBUS_FLAG_FRAME_LOST | SBUS_FLAG_FAILSAFE)) == 0u);
 
-    if (link_ok && !link_prev) link_up_ms = now;
+    if (link_ok && !link_prev) {
+        link_up_ms = now;
+    }
     link_prev = link_ok;
     link_stable = link_ok && ((now - link_up_ms) >= LINK_STABLE_MS);
 
@@ -451,8 +640,12 @@ static void motor_step(void)
         win_min = ch_thr;
         win_max = ch_thr;
     } else {
-        if (ch_thr < win_min) win_min = ch_thr;
-        if (ch_thr > win_max) win_max = ch_thr;
+        if (ch_thr < win_min) {
+            win_min = ch_thr;
+        }
+        if (ch_thr > win_max) {
+            win_max = ch_thr;
+        }
         if ((uint16_t)(win_max - win_min) > THR_STABLE_BAND) {
             low_since_ms = now;
             win_min = ch_thr;
@@ -462,8 +655,10 @@ static void motor_step(void)
     stick_stable_low = low_tracking && ((now - low_since_ms) >= ARM_LOW_HOLD_MS);
 
     arm_switch_on = (ch_arm >= ARM_SWITCH_THRESHOLD);
+    /* This project's switch convention: kill is ACTIVE when CH_KILL is high. */
     kill_switch_on = (ch_kill >= KILL_SWITCH_THRESHOLD);
 
+    /* Mandatory switch sequence: arm switch LOW first, then HIGH to arm. */
     if ((elapsed < ESC_INIT_MS) || !link_ok || kill_switch_on) {
         armed = false;
         arm_ready = false;
@@ -475,102 +670,63 @@ static void motor_step(void)
         throttle_zero = win_max;
         throttle_ratio = 0.0f;
         spinning = false;
-        roll_integral = 0.0f; // Reset PID khi mới Arm
-        pitch_integral = 0.0f;
     }
 
     if (!armed) {
         spinning = false;
         throttle_ratio = 0.0f;
-        roll_angle = 0.0f;
-        pitch_angle = 0.0f;
     } else {
         threshold = (float)throttle_zero + THR_DEADBAND;
-        if (!spinning && throttle_filtered > threshold + THR_START_HYST) spinning = true;
-        else if (spinning && throttle_filtered < threshold - THR_STOP_HYST) spinning = false;
+        if (!spinning && throttle_filtered > threshold + THR_START_HYST) {
+            spinning = true;
+        } else if (spinning && throttle_filtered < threshold - THR_STOP_HYST) {
+            spinning = false;
+        }
 
         if (spinning) {
             denominator = (float)SBUS_MAX - threshold;
-            if (denominator > 1.0f) target_ratio = (throttle_filtered - threshold) / denominator;
-            if (target_ratio < 0.0f) target_ratio = 0.0f;
-            else if (target_ratio > 1.0f) target_ratio = 1.0f;
+            if (denominator > 1.0f) {
+                target_ratio = (throttle_filtered - threshold) / denominator;
+            }
+            if (target_ratio < 0.0f) {
+                target_ratio = 0.0f;
+            } else if (target_ratio > 1.0f) {
+                target_ratio = 1.0f;
+            }
         }
 
-        if (target_ratio > throttle_ratio + step_up) throttle_ratio += step_up;
-        else throttle_ratio = target_ratio;
-    }
-
-    /* ==================== TÍNH TOÁN PID (ROLL & PITCH) ==================== */
-    float pid_roll = 0.0f;
-    float pid_pitch = 0.0f;
-
-    if (armed) {
-        uint32_t dt_ms = now - last_pid_ms;
-        if (dt_ms >= 1) { // Tính PID mỗi 1ms
-            last_pid_ms = now;
-            float dt = (float)dt_ms / 1000.0f;
-
-            // Cập nhật góc nghiêng
-            update_attitude(dt_ms);
-
-            // Tính sai số (Setpoint = 0, tức là mong muốn thăng bằng)
-            float error_roll = 0.0f - roll_angle;
-            float error_pitch = 0.0f - pitch_angle;
-
-            // Tính tích phân (I)
-            roll_integral += error_roll * dt;
-            pitch_integral += error_pitch * dt;
-
-            // Chống tràn tích phân (Anti-windup)
-            if (roll_integral > PID_I_LIMIT) roll_integral = PID_I_LIMIT;
-            else if (roll_integral < -PID_I_LIMIT) roll_integral = -PID_I_LIMIT;
-            if (pitch_integral > PID_I_LIMIT) pitch_integral = PID_I_LIMIT;
-            else if (pitch_integral < -PID_I_LIMIT) pitch_integral = -PID_I_LIMIT;
-
-            // Tính vi phân (D) - Lấy đạo hàm của góc thay vì đạo hàm sai số để tránh Derivative Kick
-            float d_roll = -((float)(GYRO_MDPS(gyro_x - gyro_bias_x_raw)) / 1000.0f);
-            float d_pitch = -((float)(GYRO_MDPS(gyro_y - gyro_bias_y_raw)) / 1000.0f);
-
-            // Tổng hợp PID
-            pid_roll = (PID_KP_ROLL * error_roll) + (PID_KI_ROLL * roll_integral) + (PID_KD_ROLL * d_roll);
-            pid_pitch = (PID_KP_PITCH * error_pitch) + (PID_KI_PITCH * pitch_integral) + (PID_KD_PITCH * d_pitch);
-        }
-    }
-
-    /* ==================== MIXER (QUAD-X) ==================== */
-    pulse_us = PWM_MIN_US + throttle_ratio * (PWM_MAX_US - PWM_MIN_US);
-    float m1 = pulse_us, m2 = pulse_us, m3 = pulse_us, m4 = pulse_us;
-
-    if (armed && spinning) {
-        /*
-         * SƠ ĐỒ ĐỘNG CƠ QUAD-X (Nhìn từ trên xuống):
-         * M1 (PA6) - Trước Trái  |  M2 (PA4) - Sau Trái
-         * M3 (PB0) - Sau Phải    |  M4 (PB1) - Trước Phải
-         *
-         * (Nếu mạch thực tế đảo chiều, bạn chỉ cần đổi dấu + thành - ở Mixer)
-         */
-        m1 = pulse_us + pid_pitch - pid_roll; // Trước Trái
-        m2 = pulse_us - pid_pitch - pid_roll; // Sau Trái
-        m3 = pulse_us - pid_pitch + pid_roll; // Sau Phải
-        m4 = pulse_us + pid_pitch + pid_roll; // Trước Phải
-    }
-
-    // Gán giá trị và giới hạn xung
-    for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) {
-        if (armed && spinning && ((TEST_MOTOR_MASK >> i) & 1u) != 0u) {
-            float final_pulse = (i == 0) ? m1 : (i == 1) ? m2 : (i == 2) ? m3 : m4;
-            if (final_pulse > PWM_MAX_US) final_pulse = PWM_MAX_US;
-            if (final_pulse < PWM_MIN_US) final_pulse = PWM_MIN_US;
-            output_us[i] = final_pulse;
+        /* Limit throttle ramp-up; reductions apply immediately. */
+        if (target_ratio > throttle_ratio + step_up) {
+            throttle_ratio += step_up;
         } else {
-            output_us[i] = PWM_MIN_US;
+            throttle_ratio = target_ratio;
         }
     }
 
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pulse_us_to_ccr(output_us[0]));
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, pulse_us_to_ccr(output_us[1]));
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_3, pulse_us_to_ccr(output_us[2]));
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_4, pulse_us_to_ccr(output_us[3]));
+    /* DShot throttle: 0 means stop; normal throttle values are 48..2047. */
+    for (i = 0u; i < PWM_OUTPUT_COUNT; ++i) {
+        if (armed && spinning && ((TEST_MOTOR_MASK >> i) & 1u) != 0u) {
+            float scaled = (float)DSHOT_THROTTLE_MIN +
+                           throttle_ratio * (float)(DSHOT_THROTTLE_MAX - DSHOT_THROTTLE_MIN);
+            if (scaled < (float)DSHOT_THROTTLE_MIN) {
+                scaled = (float)DSHOT_THROTTLE_MIN;
+            } else if (scaled > (float)DSHOT_THROTTLE_MAX) {
+                scaled = (float)DSHOT_THROTTLE_MAX;
+            }
+            output_dshot[i] = (uint16_t)(scaled + 0.5f);
+        } else {
+            output_dshot[i] = 0u;
+        }
+    }
+
+    if (!dshot_send_all(output_dshot)) {
+        /* DMA trouble is treated as a motor-control fault: disarm and command 0. */
+        armed = false;
+        arm_ready = false;
+        spinning = false;
+        throttle_ratio = 0.0f;
+        dshot_clear_command();
+    }
 
     debug_age_ms = age_ms;
     debug_frames_ok = frames_ok;
@@ -587,13 +743,21 @@ void uav_test_init(void)
 {
     HAL_StatusTypeDef status;
 
-    __HAL_TIM_SET_PRESCALER(&htim3, (TIM3_CLK_HZ / PWM_TICK_HZ) - 1u);
-    __HAL_TIM_SET_AUTORELOAD(&htim3, (PWM_TICK_HZ / PWM_FREQ_HZ) - 1u);
+    /* TIM3 becomes the DShot300 symbol clock: 170 MHz / 567 ~= 300 kbit/s. */
+    __HAL_TIM_DISABLE_DMA(&htim3, TIM_DMA_UPDATE);
+    __HAL_TIM_SET_PRESCALER(&htim3, 0u);
+    __HAL_TIM_SET_AUTORELOAD(&htim3, DSHOT_TIMER_PERIOD_TICKS - 1u);
+    /* Preload compare values so all four pulse widths latch on one timer update. */
+    SET_BIT(htim3.Instance->CCMR1, TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE);
+    SET_BIT(htim3.Instance->CCMR2, TIM_CCMR2_OC3PE | TIM_CCMR2_OC4PE);
+    /* TIM3 DMA-burst: one update request transfers CCR1..CCR4 via TIM3_DMAR. */
+    htim3.Instance->DCR = TIM_DMABASE_CCR1 | TIM_DMABURSTLENGTH_4TRANSFERS;
     __HAL_TIM_SET_COUNTER(&htim3, 0u);
-    set_all_motor_pulses(PWM_MIN_US);
+    dshot_clear_command();
     htim3.Instance->EGR = TIM_EGR_UG;
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 
+    /* Arm safety state is reset before any DShot packet can be transmitted. */
     armed = false;
     arm_ready = false;
     spinning = false;
@@ -603,48 +767,63 @@ void uav_test_init(void)
     throttle_ratio = 0.0f;
     sbus_frame_pos = 0u;
     sbus_rx_rearm_pending = 1u;
-    roll_integral = 0.0f;
-    pitch_integral = 0.0f;
-    last_pid_ms = HAL_GetTick();
 
+    /* TIM3_UP DMA was initialized and linked by HAL_TIM_Base_MspInit(). */
+
+    /* Initialize and calibrate the IMU while ESC outputs remain low. */
     imu_ready = mpu6500_init_spi();
-    if (imu_ready) {
-        gyro_cal_ok = mpu6500_calibrate_gyro(); // Gọi 1 lần để lấy bias
+    if (imu_ready && !mpu6500_calibrate_gyro()) {
+        log_async("GYRO_CAL ERROR: keep UAV stationary during startup\r\n");
+    }
+
+    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    if (status != HAL_OK) {
+        Error_Handler();
+    }
+    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+    if (status != HAL_OK) {
+        dshot_clear_command();
+        Error_Handler();
+    }
+    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+    if (status != HAL_OK) {
+        dshot_clear_command();
+        Error_Handler();
+    }
+    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4);
+    if (status != HAL_OK) {
+        dshot_clear_command();
+        Error_Handler();
     }
 
     boot_ms = HAL_GetTick();
-    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); if (status != HAL_OK) Error_Handler();
-    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2); if (status != HAL_OK) Error_Handler();
-    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3); if (status != HAL_OK) Error_Handler();
-    status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4); if (status != HAL_OK) Error_Handler();
-
-    __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
     sbus_service_receive_restart();
 
     if (imu_ready) {
-        log_async("IMU OK cal=%u | PID Enabled | READY: PWM %u Hz\r\n", gyro_cal_ok ? 1u : 0u, (unsigned)PWM_FREQ_HZ);
+        log_async("IMU OK: MPU6500 WHO_AM_I=0x70 | READY: SBUS -> 4x DShot300\r\n");
     } else {
-        log_async("IMU ERROR: check SPI2/wiring | READY: PWM %u Hz\r\n", (unsigned)PWM_FREQ_HZ);
+        log_async("IMU ERROR: check SPI2/CS PB12/power/wiring | DShot300 active\r\n");
     }
 }
 
 void uav_test_loop(void)
 {
+    static uint32_t last_motor_update_ms;
     static uint32_t last_log_ms;
     static uint32_t last_imu_ms;
-    static uint8_t log_phase;
-    static uint8_t log_sent_phase;
-    uint32_t now;
+    /* Offset IMU logging from the 200-ms link log so the UART TX busy guard
+       does not drop every IMU line when both periods expire together. */
+    static uint32_t last_imu_log_ms = 500u;
+    uint32_t now = HAL_GetTick();
 
     sbus_service_receive_restart();
 
-    if (__HAL_TIM_GET_FLAG(&htim3, TIM_FLAG_UPDATE) != RESET) {
-        __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
+    /* Motor control runs at 1 kHz. TIM3 itself runs at the DShot bit rate. */
+    if ((now - last_motor_update_ms) >= DSHOT_CONTROL_PERIOD_MS) {
+        last_motor_update_ms = now;
         motor_step();
     }
 
-    now = HAL_GetTick();
-    // Đọc IMU với tần số cao nhất có thể (1ms/lần)
     if (imu_ready && ((now - last_imu_ms) >= IMU_SAMPLE_PERIOD_MS)) {
         last_imu_ms = now;
         (void)mpu6500_read_spi();
@@ -652,21 +831,31 @@ void uav_test_loop(void)
 
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
         last_log_ms = now;
-        log_phase ^= 1u;
+        log_async("LINK=%u age=%lu thr=%u arm=%u kill=%u ARM=%u R=%u "
+                  "DSHOT=%u/%u/%u/%u txDone=%lu txErr=%lu frames=%lu bad=%lu uartErr=%lu\r\n",
+                  debug_link_ok ? 1u : 0u,
+                  (unsigned long)debug_age_ms,
+                  (unsigned)debug_throttle,
+                  (unsigned)debug_arm,
+                  (unsigned)debug_kill,
+                  armed ? 1u : 0u,
+                  (unsigned)(throttle_ratio * 100.0f),
+                  (unsigned)output_dshot[0],
+                  (unsigned)output_dshot[1],
+                  (unsigned)output_dshot[2],
+                  (unsigned)output_dshot[3],
+                  (unsigned long)dshot_tx_done,
+                  (unsigned long)dshot_tx_errors,
+                  (unsigned long)debug_frames_ok,
+                  (unsigned long)debug_frames_bad,
+                  (unsigned long)debug_uart_errors);
     }
 
-    if (log_phase != log_sent_phase) {
-        log_sent_phase = log_phase;
-        if (log_phase == 0u) {
-            log_async("LINK=%u thr=%u arm=%u kill=%u ARM=%u R=%u "
-                      "PWM=%u/%u/%u/%u\r\n",
-                      debug_link_ok ? 1u : 0u, (unsigned)debug_throttle, (unsigned)debug_arm, (unsigned)debug_kill,
-                      armed ? 1u : 0u, (unsigned)(throttle_ratio * 100.0f),
-                      (unsigned)(output_us[0] + 0.5f), (unsigned)(output_us[1] + 0.5f),
-                      (unsigned)(output_us[2] + 0.5f), (unsigned)(output_us[3] + 0.5f));
-        } else if (imu_ready) {
-            log_async("ANGLE [deg] Roll:%d Pitch:%d\r\n",
-                      (int)roll_angle, (int)pitch_angle);
-        }
+    if (imu_ready && ((now - last_imu_log_ms) >= 1000u)) {
+        last_imu_log_ms = now;
+        log_async("IMU GX=%d GY=%d GZ=%d AX=%d AY=%d AZ=%d readErr=%lu\r\n",
+                  (int)gyro_x, (int)gyro_y, (int)gyro_z,
+                  (int)accel_x, (int)accel_y, (int)accel_z,
+                  (unsigned long)imu_read_errors);
     }
 }

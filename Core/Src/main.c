@@ -256,7 +256,7 @@ static void MX_SPI2_Init(void)
 }
 
 /**
-  * @brief TIM3 Initialization Function (Cấu hình chu kỳ cho Driver PWM)
+  * @brief TIM3 Initialization Function (DShot300 symbol timing)
   * @retval None
   */
 static void MX_TIM3_Init(void)
@@ -266,11 +266,11 @@ static void MX_TIM3_Init(void)
   TIM_OC_InitTypeDef sConfigOC = {0};
 
   htim3.Instance = TIM3;
-  /* TIM3 counter = 170 MHz / (169 + 1) = 1 MHz.
-     Period = 2499 gives 400 Hz PWM (2500 us per frame). */
-  htim3.Init.Prescaler = 169;
+  /* Runtime uses TIM3 as a DShot300 symbol clock: PSC=0, ARR=566.
+     uav_test_init() re-applies these values and enables 4-channel output. */
+  htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 2499;
+  htim3.Init.Period = 566;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
