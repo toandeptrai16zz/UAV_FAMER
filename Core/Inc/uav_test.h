@@ -5,6 +5,7 @@
 extern "C" {
 #endif
 
+/* SBUS/DShot300 bench controller + MPU6500; PID is disabled by default. */
 void uav_test_init(void);
 void uav_test_loop(void);
 

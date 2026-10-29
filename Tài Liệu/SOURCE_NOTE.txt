@@ -1,0 +1,1 @@
+uav_test.c in this package is based on the user-provided SBUS + DShot300 + MPU6500 + PID source and has been revised for calibration, IMU handling, diagnostics, and safety defaults. Original board pin and timer configuration was retained from the prior source package.
