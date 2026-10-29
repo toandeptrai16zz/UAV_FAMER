@@ -66,8 +66,12 @@ extern SPI_HandleTypeDef hspi2;
 #define ARM_LOW_HOLD_MS             500u
 #define LINK_STABLE_MS              1000u
 #define LOG_PERIOD_MS               200u
-#define IMU_SAMPLE_PERIOD_MS        2u
+#define IMU_SAMPLE_PERIOD_MS        1u   /* sensor ODR = 1 kHz */
 #define SPI_TIMEOUT_MS              5u
+
+/* Gyro +/-500 dps -> 65.5 LSB/dps; accel +/-4 g -> 8192 LSB/g */
+#define GYRO_MDPS(raw_minus_bias)   (((int32_t)(raw_minus_bias) * 2000) / 131)
+#define ACCEL_MG(raw)               (((int32_t)(raw) * 125) / 1024)
 
 #define CS_LOW()  HAL_GPIO_WritePin(IMU_GPIO_Port, IMU_Pin, GPIO_PIN_RESET)
 #define CS_HIGH() HAL_GPIO_WritePin(IMU_GPIO_Port, IMU_Pin, GPIO_PIN_SET)
@@ -106,6 +110,7 @@ static void log_async(const char *fmt, ...)
 static int16_t accel_x, accel_y, accel_z;
 static int16_t gyro_x, gyro_y, gyro_z;
 static bool imu_ready;
+static bool gyro_cal_ok;
 static uint32_t imu_read_errors;
 
 static HAL_StatusTypeDef mpu_write_reg(uint8_t reg, uint8_t value)
@@ -141,19 +146,24 @@ static HAL_StatusTypeDef mpu_read_reg(uint8_t reg, uint8_t *value)
 
 static HAL_StatusTypeDef mpu_read_regs(uint8_t reg, uint8_t *buffer, uint16_t len)
 {
-    uint8_t tx_reg = (uint8_t)(reg | 0x80u);
+    /* One CS-low transaction: address byte + len data bytes. */
+    uint8_t tx[15] = {0};
+    uint8_t rx[15] = {0};
     HAL_StatusTypeDef status;
 
-    if ((buffer == NULL) || (len == 0u)) {
+    if ((buffer == NULL) || (len == 0u) || (len > 14u)) {
         return HAL_ERROR;
     }
 
+    tx[0] = (uint8_t)(reg | 0x80u);
+
     CS_LOW();
-    status = HAL_SPI_Transmit(&hspi2, &tx_reg, 1u, SPI_TIMEOUT_MS);
-    if (status == HAL_OK) {
-        status = HAL_SPI_Receive(&hspi2, buffer, len, SPI_TIMEOUT_MS);
-    }
+    status = HAL_SPI_TransmitReceive(&hspi2, tx, rx, (uint16_t)(len + 1u), SPI_TIMEOUT_MS);
     CS_HIGH();
+
+    if (status == HAL_OK) {
+        memcpy(buffer, &rx[1], len);
+    }
     return status;
 }
 
@@ -179,14 +189,31 @@ static bool mpu6500_init_spi(void)
     }
     HAL_Delay(100u);
 
-    /* Use the X-gyro PLL clock, 1 kHz output base when DLPF is enabled. */
-    if ((mpu_write_reg(0x6Bu, 0x01u) != HAL_OK) ||
-        (mpu_write_reg(0x19u, 0x01u) != HAL_OK) || /* Sample-rate divider */
-        (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) || /* DLPF */
-        (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) || /* Gyro +/- 500 dps */
-        (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK))  /* Accel +/- 4 g */
+    /* SPI-mode recommendation: reset signal paths and disable the I2C interface. */
+    if (mpu_write_reg(0x6Au, 0x11u) != HAL_OK) { /* I2C_IF_DIS | SIG_COND_RST */
+        return false;
+    }
+    HAL_Delay(100u);
+
+    if ((mpu_write_reg(0x6Bu, 0x01u) != HAL_OK) || /* PLL clock, wake up */
+        (mpu_write_reg(0x6Cu, 0x00u) != HAL_OK) || /* all axes enabled */
+        (mpu_write_reg(0x19u, 0x00u) != HAL_OK) || /* 1 kHz / (1+0) */
+        (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) || /* gyro DLPF 41 Hz */
+        (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) || /* gyro +/-500 dps */
+        (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK) || /* accel +/-4 g */
+        (mpu_write_reg(0x1Du, 0x03u) != HAL_OK))   /* accel DLPF 41 Hz */
     {
         return false;
+    }
+
+    /* Read back to make sure the writes really landed. */
+    {
+        uint8_t gcfg = 0u, acfg = 0u;
+        if ((mpu_read_reg(0x1Bu, &gcfg) != HAL_OK) ||
+            (mpu_read_reg(0x1Cu, &acfg) != HAL_OK) ||
+            (gcfg != 0x08u) || (acfg != 0x08u)) {
+            return false;
+        }
     }
 
     HAL_Delay(10u);
@@ -218,45 +245,57 @@ static int32_t gyro_bias_x_raw;
 static int32_t gyro_bias_y_raw;
 static int32_t gyro_bias_z_raw;
 
+#define GYRO_CAL_MAX_SPREAD_RAW 300  /* ~4.5 dps peak-to-peak: board was moved */
+
 static bool mpu6500_calibrate_gyro(void)
 {
-    int64_t sum_x = 0;
-    int64_t sum_y = 0;
-    int64_t sum_z = 0;
+    int64_t sum[3] = {0, 0, 0};
+    int16_t vmin[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
+    int16_t vmax[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
     uint32_t valid_samples = 0;
+    uint8_t a;
 
-    /* Chờ cảm biến ổn định; board phải nằm yên. */
-    HAL_Delay(2000u);
+    /* Board must be perfectly still; let the reset-button jolt settle. */
+    HAL_Delay(1000u);
 
     for (uint32_t i = 0; i < GYRO_CAL_SAMPLES; i++) {
         if (mpu6500_read_spi()) {
-            sum_x += gyro_x;
-            sum_y += gyro_y;
-            sum_z += gyro_z;
+            int16_t v[3] = {gyro_x, gyro_y, gyro_z};
+            for (a = 0u; a < 3u; a++) {
+                sum[a] += v[a];
+                if (v[a] < vmin[a]) { vmin[a] = v[a]; }
+                if (v[a] > vmax[a]) { vmax[a] = v[a]; }
+            }
             valid_samples++;
         }
-
         HAL_Delay(2u);
     }
 
-    /* Không chấp nhận kết quả nếu mất quá 5% số mẫu. */
     if (valid_samples < (GYRO_CAL_SAMPLES * 95u) / 100u) {
         return false;
     }
+    for (a = 0u; a < 3u; a++) {
+        if ((vmax[a] - vmin[a]) > GYRO_CAL_MAX_SPREAD_RAW) {
+            return false;
+        }
+    }
 
-    gyro_bias_x_raw = (int32_t)(sum_x / valid_samples);
-    gyro_bias_y_raw = (int32_t)(sum_y / valid_samples);
-    gyro_bias_z_raw = (int32_t)(sum_z / valid_samples);
-
-    log_async(
-        "GYRO_CAL bias_raw X=%ld Y=%ld Z=%ld n=%lu\r\n",
-        (long)gyro_bias_x_raw,
-        (long)gyro_bias_y_raw,
-        (long)gyro_bias_z_raw,
-        (unsigned long)valid_samples
-    );
-
+    gyro_bias_x_raw = (int32_t)(sum[0] / valid_samples);
+    gyro_bias_y_raw = (int32_t)(sum[1] / valid_samples);
+    gyro_bias_z_raw = (int32_t)(sum[2] / valid_samples);
     return true;
+}
+
+static bool mpu6500_calibrate_gyro_retry(void)
+{
+    uint8_t attempt;
+
+    for (attempt = 0u; attempt < 3u; attempt++) {
+        if (mpu6500_calibrate_gyro()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ----------------------------- SBUS ----------------------------------- */
@@ -629,11 +668,6 @@ void uav_test_init(void)
     htim3.Instance->EGR = TIM_EGR_UG;
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 
-    if (imu_ready) {
-        if (!mpu6500_calibrate_gyro()) {
-            log_async("GYRO_CAL ERROR\r\n");
-        }
-    }
     /* Arm safety is switch-based; do not arm automatically on low throttle. */
     armed = false;
     arm_ready = false;
@@ -648,6 +682,9 @@ void uav_test_init(void)
     /* Initialize IMU while PWM is still stopped. The ESC initialization timer
        starts only when valid minimum PWM pulses are about to be emitted. */
     imu_ready = mpu6500_init_spi();
+    if (imu_ready) {
+        gyro_cal_ok = mpu6500_calibrate_gyro_retry();
+    }
 
     boot_ms = HAL_GetTick();
     status = HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -676,7 +713,9 @@ void uav_test_init(void)
     /* Combine startup status into one transmission: log_async intentionally
        refuses a second message while the previous interrupt TX is active. */
     if (imu_ready) {
-        log_async("IMU OK: MPU6500 WHO_AM_I=0x70 | READY: SBUS -> 4x PWM %u Hz\r\n",
+        log_async("IMU OK cal=%u bias=%ld/%ld/%ld | READY: PWM %u Hz\r\n",
+                  gyro_cal_ok ? 1u : 0u,
+                  (long)gyro_bias_x_raw, (long)gyro_bias_y_raw, (long)gyro_bias_z_raw,
                   (unsigned)PWM_FREQ_HZ);
     } else {
         log_async("IMU ERROR: check SPI2/CS PB12/power/wiring | READY: PWM %u Hz\r\n",
@@ -688,9 +727,8 @@ void uav_test_loop(void)
 {
     static uint32_t last_log_ms;
     static uint32_t last_imu_ms;
-    /* Offset IMU logging from the 200-ms link log so the UART TX busy guard
-       does not drop every IMU line when both periods expire together. */
-    static uint32_t last_imu_log_ms = 500u;
+    static uint8_t log_phase;
+    static uint8_t log_sent_phase;
     uint32_t now;
 
     sbus_service_receive_restart();
@@ -709,6 +747,13 @@ void uav_test_loop(void)
 
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
         last_log_ms = now;
+        log_phase ^= 1u;
+    }
+
+    /* One shared TX buffer: alternate the two lines on each tick so neither is dropped. */
+    if (log_phase != log_sent_phase) {
+        log_sent_phase = log_phase;
+      if (log_phase == 0u) {
         log_async("LINK=%u age=%lu thr=%u arm=%u kill=%u ARM=%u R=%u "
                   "PWM=%u/%u/%u/%u frames=%lu bad=%lu uartErr=%lu\r\n",
                   debug_link_ok ? 1u : 0u,
@@ -725,13 +770,14 @@ void uav_test_loop(void)
                   (unsigned long)debug_frames_ok,
                   (unsigned long)debug_frames_bad,
                   (unsigned long)debug_uart_errors);
-    }
-
-    if (imu_ready && ((now - last_imu_log_ms) >= 1000u)) {
-        last_imu_log_ms = now;
-        log_async("IMU GX=%d GY=%d GZ=%d AX=%d AY=%d AZ=%d readErr=%lu\r\n",
-                  (int)gyro_x, (int)gyro_y, (int)gyro_z,
-                  (int)accel_x, (int)accel_y, (int)accel_z,
+      } else if (imu_ready) {
+        log_async("IMU cal=%u gyro[mdps] %ld %ld %ld | accel[mg] %ld %ld %ld | readErr=%lu\r\n",
+                  gyro_cal_ok ? 1u : 0u,
+                  (long)GYRO_MDPS(gyro_x - gyro_bias_x_raw),
+                  (long)GYRO_MDPS(gyro_y - gyro_bias_y_raw),
+                  (long)GYRO_MDPS(gyro_z - gyro_bias_z_raw),
+                  (long)ACCEL_MG(accel_x), (long)ACCEL_MG(accel_y), (long)ACCEL_MG(accel_z),
                   (unsigned long)imu_read_errors);
+      }
     }
 }
