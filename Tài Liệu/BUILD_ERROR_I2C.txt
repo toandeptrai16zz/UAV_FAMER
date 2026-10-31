@@ -1,0 +1,14 @@
+BUILD ERROR DIAGNOSIS
+
+The compiler command already searches ../Drivers/STM32G4xx_HAL_Driver/Inc.
+The error is therefore caused by the missing vendor header file, not by a bad -I path.
+
+Required matching STM32G4 HAL files:
+  Inc/stm32g4xx_hal_i2c.h
+  Inc/stm32g4xx_hal_i2c_ex.h
+  Src/stm32g4xx_hal_i2c.c
+  Src/stm32g4xx_hal_i2c_ex.c
+
+Use all four from the same STM32CubeG4/HAL release already used by this project.
+Do not create placeholder HAL headers and do not disable HAL_I2C_MODULE_ENABLED while DPS310/I2C1 is in use.
+Make sure both .c files are included in the CubeIDE build.

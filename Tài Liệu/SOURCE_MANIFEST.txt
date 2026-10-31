@@ -1,0 +1,4 @@
+Runtime source/header overlay for STM32G474RE DShot300 project.
+Contains 8 C sources, 7 headers, UAV_.ioc and README_VI.md.
+No host-test source with a second main() is included.
+All supplied runtime C/H files are retained; the generated system support files are required.

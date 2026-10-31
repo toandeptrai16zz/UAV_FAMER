@@ -1,11 +1,12 @@
 /*
  * uav_test.c
- * SBUS -> 4-channel DShot300 (DMA-burst) + MPU6500 SPI + optional roll/pitch PID
+ * SBUS -> 4-channel DShot300 (TIM3 DMA-burst) + MPU6500 attitude PID + optional DPS310
  */
 
 #include "main.h"
 #include "uav_test.h"
 #include "dshot_protocol.h"
+#include "dps310.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,6 +21,8 @@ extern UART_HandleTypeDef hlpuart1;
 extern TIM_HandleTypeDef htim3;
 extern SPI_HandleTypeDef hspi2;
 extern DMA_HandleTypeDef hdma_tim3_up;
+extern I2C_HandleTypeDef hi2c1;
+
 
 /* ---------------------------- DShot config ---------------------------- */
 #define DSHOT_TIMER_PERIOD_TICKS    567u  
@@ -35,7 +38,7 @@ extern DMA_HandleTypeDef hdma_tim3_up;
 #define TEST_MOTOR_MASK             0x0Fu
 
 #define THR_FILTER_ALPHA            0.30f
-#define SLEW_UP_RATIO_PER_S          1.0f  /* limit rise to full scale over at least ~1 s */
+#define SLEW_UP_RATIO_PER_S          5.0f  /* full-scale rise limit: about 200 ms */
 
 /* ----------------------------- SBUS config ---------------------------- */
 #define SBUS_FRAME_SIZE             25u
@@ -66,9 +69,11 @@ extern DMA_HandleTypeDef hdma_tim3_up;
 #define CH_ARM                       4u
 #define CH_KILL                      5u
 
-/* Thresholds retain the mapping used by the supplied project/log. Verify switch polarity. */
-#define ARM_SWITCH_THRESHOLD         1320u  /* log shows 1000 in one state; verify ON/OFF raw values */
+/* Switch thresholds/polarity are project defaults; verify both states in the TX monitor. */
+#define ARM_SWITCH_THRESHOLD         1320u
+#define ARM_SWITCH_ACTIVE_HIGH       1u
 #define KILL_SWITCH_THRESHOLD        1500u
+#define KILL_SWITCH_ACTIVE_HIGH      1u
 
 /* ----------------------------- Arm safety ----------------------------- */
 #define THR_DEADBAND                40.0f
@@ -81,11 +86,12 @@ extern DMA_HandleTypeDef hdma_tim3_up;
 #define LOG_PERIOD_MS               200u
 #define IMU_SAMPLE_PERIOD_MS        1u
 #define IMU_MAX_AGE_MS               20u
-#define SPI_TIMEOUT_MS              5u
+#define SPI_TIMEOUT_MS              2u
 
 /*
- * Keep attitude PID disabled for the first motor/ESC bench verification.
- * Set to 1 only after IMU axes, motor order/directions and gains are verified.
+ * Roll/pitch angle PID is enabled in this build.  Before fitting propellers,
+ * verify IMU mounting axes, roll/pitch signs, motor order and motor directions.
+ * Set to 0 only for a propeller-off ESC/DShot bench test.
  */
 #define ENABLE_ATTITUDE_PID          1u
 #define PID_ANGLE_LIMIT_DEG          25.0f
@@ -155,6 +161,8 @@ static int16_t accel_x, accel_y, accel_z;
 static int16_t gyro_x, gyro_y, gyro_z;
 static bool imu_ready;
 static bool imu_calibrated;
+static DPS310_HandleTypeDef barometer;
+static bool barometer_ready;
 static uint32_t imu_read_errors;
 static uint32_t imu_last_good_ms;
 static uint32_t imu_sample_sequence;
@@ -316,8 +324,13 @@ static volatile uint8_t sbus_flags;
 static volatile uint32_t sbus_frames_ok, sbus_frames_bad, sbus_uart_errors, sbus_last_valid_ms;
 static volatile uint8_t sbus_rx_rearm_pending = 1u;
 
-static bool sbus_footer_valid(uint8_t footer) {
-    return (footer == 0x00u) || (footer == 0x08u) || ((footer & 0x0Fu) == 0x04u);
+static bool sbus_footer_valid(uint8_t footer)
+{
+    const uint8_t slot_code = (uint8_t)(footer & 0x0Fu);
+
+    /* SBUS uses 0x00; SBUS2 uses footer slot codes 0x04 or 0x08.
+       The upper nibble carries the telemetry slot and must be ignored. */
+    return (footer == 0x00u) || (slot_code == 0x04u) || (slot_code == 0x08u);
 }
 
 static void sbus_decode_frame(const uint8_t frame[SBUS_FRAME_SIZE]) {
@@ -445,8 +458,9 @@ static uint32_t link_up_ms, low_since_ms;
 static uint16_t win_min, win_max, throttle_zero;
 static float throttle_filtered, throttle_ratio;
 static uint32_t debug_age_ms, debug_frames_ok, debug_frames_bad, debug_uart_errors;
-static uint16_t debug_throttle, debug_arm, debug_kill;
-static bool debug_link_ok, debug_imu_ok;
+static uint16_t debug_throttle, debug_roll, debug_pitch, debug_arm, debug_kill;
+static bool debug_link_ok, debug_imu_ok, debug_throttle_cal_ok;
+static float debug_pid_roll, debug_pid_pitch;
 static uint16_t output_dshot[PWM_OUTPUT_COUNT] = {0u, 0u, 0u, 0u};
 
 static void outputs_force_zero(void)
@@ -485,7 +499,7 @@ static void motor_step(void)
     uint16_t channels[16];
     uint16_t ch_thr, ch_arm, ch_kill;
     bool link_ok, link_stable, throttle_low, stick_stable_low;
-    bool arm_switch_on, kill_switch_on, imu_fresh, can_arm;
+    bool arm_switch_on, kill_switch_on, imu_fresh, can_arm, throttle_cal_ok;
     float threshold = 0.0f, denominator, target_ratio = 0.0f;
     float step_up = SLEW_UP_RATIO_PER_S * ((float)DSHOT_CONTROL_PERIOD_MS / 1000.0f);
     float pid_roll = 0.0f, pid_pitch = 0.0f;
@@ -506,16 +520,12 @@ static void motor_step(void)
     ch_kill = channels[CH_KILL];
     age_ms = now - last_valid_ms;
 
+    throttle_cal_ok = throttle_calibration_valid();
     link_ok = (frames_ok > 0u) && (age_ms < SBUS_LINK_TIMEOUT_MS) &&
               ((flags & (SBUS_FLAG_FRAME_LOST | SBUS_FLAG_FAILSAFE)) == 0u);
     if (link_ok && !link_prev) link_up_ms = now;
     link_prev = link_ok;
     link_stable = link_ok && ((now - link_up_ms) >= LINK_STABLE_MS);
-
-    if (!throttle_calibration_valid()) {
-        /* Invalid endpoints are a configuration fault: refuse to arm. */
-        link_ok = false;
-    }
 
     if (frames_ok > 0u) {
         if (!throttle_filter_initialized) {
@@ -529,7 +539,7 @@ static void motor_step(void)
         low_tracking = false;
     }
 
-    throttle_low = (frames_ok > 0u) && link_ok &&
+    throttle_low = (frames_ok > 0u) && link_ok && throttle_cal_ok &&
         ((uint32_t)ch_thr <= ((uint32_t)SBUS_THR_LOW_RAW +
           (((uint32_t)SBUS_THR_HIGH_RAW - (uint32_t)SBUS_THR_LOW_RAW) *
            SBUS_THR_LOW_FRACTION_PCT / 100u)));
@@ -553,13 +563,21 @@ static void motor_step(void)
     }
     stick_stable_low = low_tracking && ((now - low_since_ms) >= ARM_LOW_HOLD_MS);
 
+#if ARM_SWITCH_ACTIVE_HIGH
     arm_switch_on = (ch_arm >= ARM_SWITCH_THRESHOLD);
+#else
+    arm_switch_on = (ch_arm <= ARM_SWITCH_THRESHOLD);
+#endif
+#if KILL_SWITCH_ACTIVE_HIGH
     kill_switch_on = (ch_kill >= KILL_SWITCH_THRESHOLD);
+#else
+    kill_switch_on = (ch_kill <= KILL_SWITCH_THRESHOLD);
+#endif
     imu_fresh = imu_ready && imu_calibrated && ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS);
 #if ENABLE_ATTITUDE_PID
-    can_arm = imu_fresh;
+    can_arm = imu_fresh && throttle_cal_ok;
 #else
-    can_arm = true; /* bench throttle test; PID is deliberately disabled by default */
+    can_arm = throttle_cal_ok; /* PID-off is for propeller-off ESC bench tests only */
 #endif
 
     if ((elapsed < ESC_INIT_MS) || !link_ok || kill_switch_on || !can_arm) {
@@ -616,9 +634,13 @@ static void motor_step(void)
             float pitch_sp = stick_to_angle_deg(channels[CH_PITCH]);
             float error_roll = roll_sp - roll_angle;
             float error_pitch = pitch_sp - pitch_angle;
-            if (dt > 0.0f) {
+            if (spinning && (dt > 0.0f)) {
                 roll_integral = clampf_local(roll_integral + error_roll * dt, -PID_I_LIMIT, PID_I_LIMIT);
                 pitch_integral = clampf_local(pitch_integral + error_pitch * dt, -PID_I_LIMIT, PID_I_LIMIT);
+            } else if (!spinning) {
+                /* Do not accumulate integral while the motors are stopped. */
+                roll_integral = 0.0f;
+                pitch_integral = 0.0f;
             }
             pid_roll = clampf_local(PID_KP_ROLL * error_roll + PID_KI_ROLL * roll_integral -
                                     PID_KD_ROLL * gyro_x_rate_dps(), -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT);
@@ -631,25 +653,55 @@ static void motor_step(void)
     }
 #endif
 
-    /* QUAD-X mixer. Motor geometry, signs and motor order MUST be verified physically. */
+    /*
+     * QUAD-X mixer. Motor order/signs depend on the actual frame and must be
+     * verified propeller-off. Scale the differential terms together when
+     * throttle headroom is limited; independent clipping distorts the mix.
+     */
     {
-        float base = spinning && armed ?
+        const float base = (armed && spinning) ?
             ((float)DSHOT_THROTTLE_MIN + throttle_ratio *
              (float)(DSHOT_THROTTLE_MAX - DSHOT_THROTTLE_MIN)) : 0.0f;
-        float mixed[PWM_OUTPUT_COUNT];
-        mixed[0] = base + pid_pitch - pid_roll;
-        mixed[1] = base - pid_pitch - pid_roll;
-        mixed[2] = base - pid_pitch + pid_roll;
-        mixed[3] = base + pid_pitch + pid_roll;
+        float correction[PWM_OUTPUT_COUNT] = {
+            pid_pitch - pid_roll,
+            -pid_pitch - pid_roll,
+            -pid_pitch + pid_roll,
+            pid_pitch + pid_roll
+        };
+        float min_corr = correction[0];
+        float max_corr = correction[0];
+        float scale = 1.0f;
+
+        for (uint8_t i = 1u; i < PWM_OUTPUT_COUNT; ++i) {
+            if (correction[i] < min_corr) min_corr = correction[i];
+            if (correction[i] > max_corr) max_corr = correction[i];
+        }
+
+        if (armed && spinning) {
+            const float low_headroom = base - (float)DSHOT_THROTTLE_MIN;
+            const float high_headroom = (float)DSHOT_THROTTLE_MAX - base;
+
+            if ((min_corr < 0.0f) && (-min_corr > low_headroom)) {
+                scale = low_headroom / (-min_corr);
+            }
+            if ((max_corr > 0.0f) && (max_corr > high_headroom)) {
+                const float high_scale = high_headroom / max_corr;
+                if (high_scale < scale) scale = high_scale;
+            }
+            if (scale < 0.0f) scale = 0.0f;
+            if (scale > 1.0f) scale = 1.0f;
+        } else {
+            scale = 0.0f;
+        }
 
         for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) {
             if (armed && spinning && ((TEST_MOTOR_MASK >> i) & 1u) != 0u) {
-                float v = mixed[i];
-                if (v < (float)DSHOT_THROTTLE_MIN) v = (float)DSHOT_THROTTLE_MIN;
-                if (v > (float)DSHOT_THROTTLE_MAX) v = (float)DSHOT_THROTTLE_MAX;
-                output_dshot[i] = (uint16_t)(v + 0.5f);
+                float value = base + correction[i] * scale;
+                if (value < (float)DSHOT_THROTTLE_MIN) value = (float)DSHOT_THROTTLE_MIN;
+                if (value > (float)DSHOT_THROTTLE_MAX) value = (float)DSHOT_THROTTLE_MAX;
+                output_dshot[i] = (uint16_t)(value + 0.5f);
             } else {
-                output_dshot[i] = 0u; /* DShot zero = stop */
+                output_dshot[i] = 0u; /* DShot 0 = stop */
             }
         }
     }
@@ -668,6 +720,11 @@ static void motor_step(void)
     debug_uart_errors = uart_errors;
     debug_link_ok = link_ok;
     debug_imu_ok = imu_fresh;
+    debug_throttle_cal_ok = throttle_cal_ok;
+    debug_roll = channels[CH_ROLL];
+    debug_pitch = channels[CH_PITCH];
+    debug_pid_roll = pid_roll;
+    debug_pid_pitch = pid_pitch;
     debug_throttle = ch_thr;
     debug_arm = ch_arm;
     debug_kill = ch_kill;
@@ -710,6 +767,13 @@ void uav_test_init(void)
     roll_angle = 0.0f;
     pitch_angle = 0.0f;
 
+    /* DPS310 is diagnostic/altitude data only; it is not part of the PID loop.
+       Try both legal 7-bit I2C addresses because breakout SDO wiring selects 0x76/0x77. */
+    barometer_ready = DPS310_Init(&barometer, &hi2c1, DPS310_I2C_ADDR_DEFAULT);
+    if (!barometer_ready) {
+        barometer_ready = DPS310_Init(&barometer, &hi2c1, DPS310_I2C_ADDR_ALT);
+    }
+
     imu_ready = mpu6500_init_spi();
     imu_calibrated = false;
     if (imu_ready) imu_calibrated = mpu6500_calibrate_gyro();
@@ -731,7 +795,9 @@ void uav_test_init(void)
 
     boot_ms = HAL_GetTick();
     sbus_service_receive_restart();
-    log_async("READY: SBUS -> 4x DShot300; PID=%u; wait ESC init\r\n", ENABLE_ATTITUDE_PID);
+    log_async("READY: SBUS -> 4x DShot300; PID=%u; IMU=%u CAL=%u BARO=%u; wait ESC init\r\n",
+              ENABLE_ATTITUDE_PID, imu_ready ? 1u : 0u, imu_calibrated ? 1u : 0u,
+              barometer_ready ? 1u : 0u);
 }
 
 void uav_test_loop(void)
@@ -741,6 +807,7 @@ void uav_test_loop(void)
     static uint32_t last_imu_ms;
     static uint32_t last_imu_log_ms = 500u;
     uint32_t now = HAL_GetTick();
+    DPS310_Data baro_data = {0};
 
     sbus_service_receive_restart();
 
@@ -763,14 +830,29 @@ void uav_test_loop(void)
         motor_step();
     }
 
+    /* Non-blocking I2C state machine: service every loop; the driver starts
+       a status read every 8 ms and handles completion through I2C interrupts. */
+    if (barometer_ready) {
+        (void)DPS310_Update(&barometer);
+    }
+    now = HAL_GetTick();
+
+    /* Get diagnostic state even when initialization failed, so Berr is visible. */
+    (void)DPS310_GetData(&barometer, &baro_data);
+
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
         last_log_ms = now;
-        log_async("LINK=%u age=%lu thr=%u armCH=%u killCH=%u ARM=%u R=%u "
+        log_async("LINK=%u age=%lu thr=%u thrCal=%u rollCH=%u pitchCH=%u armCH=%u killCH=%u ARM=%u R=%u "
                   "DSHOT=%u/%u/%u/%u txDone=%lu txErr=%lu frames=%lu bad=%lu "
-                  "uartErr=%lu IMU=%u CAL=%u imuFresh=%u imuAge=%lu imuErr=%lu PID=%u\r\n",
+                  "uartErr=%lu IMU=%u CAL=%u imuFresh=%u imuAge=%lu imuErr=%lu PID=%u "
+                  "PIDr=%ld PIDp=%ld BARO=%u Pvalid=%u Tvalid=%u ALTref=%u ALTn=%u "
+                  "P=%luPa T=%ldcC H=%ldcm Berr=%lu\r\n",
                   debug_link_ok ? 1u : 0u,
                   (unsigned long)debug_age_ms,
                   (unsigned)debug_throttle,
+                  debug_throttle_cal_ok ? 1u : 0u,
+                  (unsigned)debug_roll,
+                  (unsigned)debug_pitch,
                   (unsigned)debug_arm,
                   (unsigned)debug_kill,
                   armed ? 1u : 0u,
@@ -787,7 +869,20 @@ void uav_test_loop(void)
                   debug_imu_ok ? 1u : 0u,
                   (unsigned long)(imu_ready ? (now - imu_last_good_ms) : 0xFFFFFFFFu),
                   (unsigned long)imu_read_errors,
-                  (unsigned)ENABLE_ATTITUDE_PID);
+                  (unsigned)ENABLE_ATTITUDE_PID,
+                  (long)debug_pid_roll, (long)debug_pid_pitch,
+                  barometer_ready ? 1u : 0u,
+                  baro_data.pressure_valid ? 1u : 0u,
+                  baro_data.temperature_valid ? 1u : 0u,
+                  baro_data.altitude_reference_valid ? 1u : 0u,
+                  (unsigned)baro_data.reference_sample_count,
+                  (unsigned long)(baro_data.pressure_valid ?
+                      (uint32_t)(baro_data.pressure_pa + 0.5f) : 0u),
+                  (long)(baro_data.temperature_valid ?
+                      (int32_t)(baro_data.temperature_c * 100.0f) : 0),
+                  (long)(baro_data.altitude_valid ?
+                      (int32_t)(baro_data.altitude_filtered_m * 100.0f) : 0),
+                  (unsigned long)baro_data.error_count);
     }
 
     if (imu_ready && ((now - last_imu_log_ms) >= 1000u)) {

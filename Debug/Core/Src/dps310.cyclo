@@ -1,0 +1,14 @@
+../Core/Src/dps310.c:44:26:dps310_read_regs	5
+../Core/Src/dps310.c:63:26:dps310_write_reg	3
+../Core/Src/dps310.c:80:16:sign_extend	2
+../Core/Src/dps310.c:91:16:parse_s24	1
+../Core/Src/dps310.c:99:13:read_coefficients	3
+../Core/Src/dps310.c:137:14:compensate_temperature	1
+../Core/Src/dps310.c:144:14:compensate_pressure	1
+../Core/Src/dps310.c:156:13:update_relative_altitude	5
+../Core/Src/dps310.c:183:6:DPS310_Init	19
+../Core/Src/dps310.c:286:13:start_async_read	2
+../Core/Src/dps310.c:309:6:DPS310_Update	19
+../Core/Src/dps310.c:409:6:HAL_I2C_MemRxCpltCallback	7
+../Core/Src/dps310.c:433:6:HAL_I2C_ErrorCallback	3
+../Core/Src/dps310.c:446:6:DPS310_GetData	3
