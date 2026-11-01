@@ -58,6 +58,7 @@
 extern I2C_HandleTypeDef hi2c1;
 extern UART_HandleTypeDef hlpuart1;
 extern UART_HandleTypeDef huart1;
+extern UART_HandleTypeDef huart3;
 extern DMA_HandleTypeDef hdma_tim3_up;
 extern TIM_HandleTypeDef htim3;
 /* USER CODE BEGIN EV */
@@ -284,6 +285,14 @@ void EXTI15_10_IRQHandler(void)
   /* USER CODE BEGIN EXTI15_10_IRQn 1 */
 
   /* USER CODE END EXTI15_10_IRQn 1 */
+}
+
+/**
+  * @brief USART3 global interrupt handler (MicoAir MT-06).
+  */
+void USART3_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart3);
 }
 
 /**

@@ -7,6 +7,7 @@
 #include "uav_test.h"
 #include "dshot_protocol.h"
 #include "dps310.h"
+#include "mt06.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,6 +23,7 @@ extern TIM_HandleTypeDef htim3;
 extern SPI_HandleTypeDef hspi2;
 extern DMA_HandleTypeDef hdma_tim3_up;
 extern I2C_HandleTypeDef hi2c1;
+extern UART_HandleTypeDef huart3;
 
 
 /* ---------------------------- DShot config ---------------------------- */
@@ -136,7 +138,7 @@ static void dshot_dma_tx_error(DMA_HandleTypeDef *hdma)
 }
 
 /* ----------------------------- Logging -------------------------------- */
-static char log_buffer[384];
+static char log_buffer[512];
 
 static void log_async(const char *fmt, ...)
 {
@@ -163,6 +165,8 @@ static bool imu_ready;
 static bool imu_calibrated;
 static DPS310_HandleTypeDef barometer;
 static bool barometer_ready;
+static MT06_HandleTypeDef rangefinder;
+static bool rangefinder_ready;
 static uint32_t imu_read_errors;
 static uint32_t imu_last_good_ms;
 static uint32_t imu_sample_sequence;
@@ -377,16 +381,30 @@ static void sbus_service_receive_restart(void) {
     }
 }
 
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
-    if (huart != &huart1) return;
-    if (size > sizeof(sbus_rx_buffer)) size = sizeof(sbus_rx_buffer);
-    for (uint16_t i = 0u; i < size; ++i) sbus_feed_byte(sbus_rx_buffer[i]);
-    sbus_rx_rearm_pending = 1u;
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)
+{
+    if (huart == &huart1) {
+        if (size > sizeof(sbus_rx_buffer)) size = sizeof(sbus_rx_buffer);
+        for (uint16_t i = 0u; i < size; ++i) {
+            sbus_feed_byte(sbus_rx_buffer[i]);
+        }
+        sbus_rx_rearm_pending = 1u;
+        return;
+    }
+
+    MT06_RxEventCallback(huart, size);
 }
 
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-    if (huart != &huart1) return;
-    sbus_uart_errors++; sbus_frame_pos = 0u; sbus_rx_rearm_pending = 1u;
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart1) {
+        sbus_uart_errors++;
+        sbus_frame_pos = 0u;
+        sbus_rx_rearm_pending = 1u;
+        return;
+    }
+
+    MT06_ErrorCallback(huart);
 }
 
 /* ----------------------------- DShot Logic ---------------------------- */
@@ -774,6 +792,9 @@ void uav_test_init(void)
         barometer_ready = DPS310_Init(&barometer, &hi2c1, DPS310_I2C_ADDR_ALT);
     }
 
+    /* MT-06 must be configured as UART / MAVLink / 115200 baud. */
+    rangefinder_ready = MT06_Init(&rangefinder, &huart3);
+
     imu_ready = mpu6500_init_spi();
     imu_calibrated = false;
     if (imu_ready) imu_calibrated = mpu6500_calibrate_gyro();
@@ -795,9 +816,9 @@ void uav_test_init(void)
 
     boot_ms = HAL_GetTick();
     sbus_service_receive_restart();
-    log_async("READY: SBUS -> 4x DShot300; PID=%u; IMU=%u CAL=%u BARO=%u; wait ESC init\r\n",
+    log_async("READY: SBUS -> 4x DShot300; PID=%u; IMU=%u CAL=%u BARO=%u MT06_UART=%u; wait ESC init\r\n",
               ENABLE_ATTITUDE_PID, imu_ready ? 1u : 0u, imu_calibrated ? 1u : 0u,
-              barometer_ready ? 1u : 0u);
+              barometer_ready ? 1u : 0u, rangefinder_ready ? 1u : 0u);
 }
 
 void uav_test_loop(void)
@@ -808,8 +829,13 @@ void uav_test_loop(void)
     static uint32_t last_imu_log_ms = 500u;
     uint32_t now = HAL_GetTick();
     DPS310_Data baro_data = {0};
+    MT06_Data range_data = {0};
+    uint16_t range_vertical_cm = 0u;
 
     sbus_service_receive_restart();
+    if (rangefinder_ready) {
+        MT06_Update(&rangefinder);
+    }
 
     /* Sample the IMU before the control step so the PID sees the freshest valid sample. */
     if (imu_ready && ((now - last_imu_ms) >= IMU_SAMPLE_PERIOD_MS)) {
@@ -839,6 +865,24 @@ void uav_test_loop(void)
 
     /* Get diagnostic state even when initialization failed, so Berr is visible. */
     (void)DPS310_GetData(&barometer, &baro_data);
+    (void)MT06_GetData(&rangefinder, &range_data);
+
+    /*
+     * Diagnostic projection only; this value is NOT sent to the motor mixer.
+     * It assumes the MT-06 beam is aligned with body -Z and the IMU axes have
+     * been verified. Altitude-hold PID is intentionally not enabled here.
+     */
+    if (range_data.valid && imu_ready && imu_calibrated &&
+        ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS)) {
+        const float deg_to_rad = 0.01745329251994329577f;
+        const float tilt_factor =
+            cosf(roll_angle * deg_to_rad) * cosf(pitch_angle * deg_to_rad);
+        if ((tilt_factor > 0.70f) && (tilt_factor <= 1.01f)) {
+            float vertical_cm = (float)range_data.distance_cm * tilt_factor;
+            if (vertical_cm > 65535.0f) vertical_cm = 65535.0f;
+            range_vertical_cm = (uint16_t)(vertical_cm + 0.5f);
+        }
+    }
 
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
         last_log_ms = now;
@@ -846,7 +890,9 @@ void uav_test_loop(void)
                   "DSHOT=%u/%u/%u/%u txDone=%lu txErr=%lu frames=%lu bad=%lu "
                   "uartErr=%lu IMU=%u CAL=%u imuFresh=%u imuAge=%lu imuErr=%lu PID=%u "
                   "PIDr=%ld PIDp=%ld BARO=%u Pvalid=%u Tvalid=%u ALTref=%u ALTn=%u "
-                  "P=%luPa T=%ldcC H=%ldcm Berr=%lu\r\n",
+                  "P=%luPa T=%ldcC H=%ldcm Berr=%lu "
+                  "MT06=%u Rvalid=%u Rage=%lu R=%ucm Rvert=%ucm Rori=%u "
+                  "Rok=%lu Rbad=%lu Rerr=%lu\r\n",
                   debug_link_ok ? 1u : 0u,
                   (unsigned long)debug_age_ms,
                   (unsigned)debug_throttle,
@@ -882,7 +928,16 @@ void uav_test_loop(void)
                       (int32_t)(baro_data.temperature_c * 100.0f) : 0),
                   (long)(baro_data.altitude_valid ?
                       (int32_t)(baro_data.altitude_filtered_m * 100.0f) : 0),
-                  (unsigned long)baro_data.error_count);
+                  (unsigned long)baro_data.error_count,
+                   rangefinder_ready ? 1u : 0u,
+                   range_data.valid ? 1u : 0u,
+                   (unsigned long)range_data.age_ms,
+                   (unsigned)range_data.distance_cm,
+                   (unsigned)range_vertical_cm,
+                   (unsigned)range_data.orientation,
+                   (unsigned long)range_data.frames_ok,
+                   (unsigned long)range_data.frames_bad,
+                   (unsigned long)range_data.uart_errors);
     }
 
     if (imu_ready && ((now - last_imu_log_ms) >= 1000u)) {
