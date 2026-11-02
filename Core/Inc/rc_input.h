@@ -6,9 +6,9 @@
 /* Measured in user SBUS logs. Calibrate again if transmitter settings change. */
 #define RC_THR_MIN_RAW       40u
 #define RC_THR_MAX_RAW     1640u
-#define RC_ROLL_CENTER      961u
-#define RC_PITCH_CENTER     992u
-#define RC_YAW_CENTER      1099u
+#define RC_ROLL_CENTER      952u /* provisional: latest neutral log */
+#define RC_PITCH_CENTER    1062u /* provisional: latest neutral log */
+#define RC_YAW_CENTER      1099u /* provisional: latest neutral log */
 #define RC_STICK_MIN        172u
 #define RC_STICK_MAX       1811u
 #define RC_STICK_DEADBAND    20u

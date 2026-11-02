@@ -89,9 +89,10 @@ extern UART_HandleTypeDef huart3;
 
 /* Bench attitude controller. Gain values are uncalibrated, NOT flight gains. */
 #define ENABLE_ATTITUDE_PID          1u
-/* Mount trim must be measured with the airframe mechanically level. */
-#define IMU_ROLL_MOUNT_TRIM_DEG      0.0f
-#define IMU_PITCH_MOUNT_TRIM_DEG     0.0f
+/* Mount trim estimated from paired 0 and 180 degree readings on same floor spot.
+ * Measurements are provisional; airframe stability and axis signs are not validated. */
+#define IMU_ROLL_MOUNT_TRIM_DEG     -2.13f
+#define IMU_PITCH_MOUNT_TRIM_DEG    -1.06f
 /* Require independent sign/motor-map verification before any ARM release. */
 #define UAV_MOTOR_MAP_VERIFIED       0u
 #define UAV_IMU_AXES_VERIFIED        0u
@@ -123,6 +124,10 @@ extern UART_HandleTypeDef huart3;
 #endif
 #if UAV_PROPS_OFF_ESC_TEST && !UAV_BENCH_ARM_LOCK
 #error "PROPS-OFF test and unlocked flight ARM must never coexist"
+#endif
+/* Keep this patch strictly passive, including after manual config edits. */
+#if (UAV_BENCH_ARM_LOCK != 1u) || (UAV_PROPS_OFF_ESC_TEST != 0u)
+#error "V329 is a PROPS-OFF PASSIVE verification image: ARM must stay locked, ESC test disabled"
 #endif
 #define UAV_ENABLE_ALT_HOLD          0u
 #if UAV_ENABLE_ALT_HOLD
@@ -171,7 +176,7 @@ static void dshot_dma_tx_error(DMA_HandleTypeDef *hdma)
 /* ------------------------ Bench UART logging ------------------------- */
 /* One owner, one persistent TX buffer. Do not reuse buffer until HAL reports
  * that the complete frame has left LPUART1. Never block the 1-ms motor loop. */
-static char log_buffer[192];
+static char log_buffer[288];
 static volatile uint8_t log_tx_inflight = 0u;
 static volatile uint32_t log_tx_done = 0u;
 static volatile uint32_t log_tx_dropped = 0u;
@@ -829,7 +834,7 @@ void uav_test_init(void)
     if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 
     boot_ms = HAL_GetTick(); sbus_service_receive_restart();
-    log_async("V328 PASSIVE_YAW_SIGN_VERIFY: M1=FL_CCW M2=FR_CW M3=RL_CW M4=RR_CCW; LOCK=1 ESC_TEST=0 OUTPUT=0; IMU=%u CAL=%u\r\n",
+    log_async("V330 SBUS_FAILSAFE_DIAG: C=952/1062/1099; TRIM=-213/-106 centideg; LOCK=1 ESC_TEST=0; IMU=%u CAL=%u\r\n",
               imu_ready ? 1u : 0u, imu_calibrated ? 1u : 0u);
 }
 
@@ -873,18 +878,49 @@ void uav_test_loop(void)
     now = HAL_GetTick();
     (void)DPS310_GetData(&barometer, &baro_data);
 
-    /* V327: Read-only response check. All motor DShot commands are ZERO.
-     * R/P: centidegrees, GX/GY/GZ: gyro rates x10 deg/s.
-     * PR/PP/PY: PID axis corrections, MX: [FL,FR,RL,RR] relative mix.
-     * Never infer correctness of axis signs from one static reading.
+    /* V330: PASSIVE diagnostics of receiver failsafe, mount trim and RC neutral. These flags
+     * report only internal consistency; they do not prove physical level or flight readiness.
+     * S = sensor angle before trim; R/P = corrected body angle (x100 deg).
+     * N = RC inside deadband; LV = corrected angles/rates nearly level/stationary.
+     * Commands to every ESC remain ZERO and LOCK remains enabled.
      */
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
+        const bool rc_neutral = debug_link_ok &&
+            ((debug_roll > RC_ROLL_CENTER ? debug_roll - RC_ROLL_CENTER : RC_ROLL_CENTER - debug_roll) <= RC_STICK_DEADBAND) &&
+            ((debug_pitch > RC_PITCH_CENTER ? debug_pitch - RC_PITCH_CENTER : RC_PITCH_CENTER - debug_pitch) <= RC_STICK_DEADBAND) &&
+            ((debug_yaw > RC_YAW_CENTER ? debug_yaw - RC_YAW_CENTER : RC_YAW_CENTER - debug_yaw) <= RC_STICK_DEADBAND);
+        const bool level_and_still = imu_ready && imu_calibrated &&
+            ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS) &&
+            (fabsf(roll_angle) <= 2.0f) && (fabsf(pitch_angle) <= 2.0f) &&
+            (fabsf(gyro_x_rate_dps()) <= 3.0f) &&
+            (fabsf(gyro_y_rate_dps()) <= 3.0f) &&
+            (fabsf(gyro_z_rate_dps()) <= 3.0f);
+        /* L reflects valid SBUS transport and status flags, NOT direct RF telemetry.
+         * A receiver that retransmits preset channels without flags cannot be
+         * distinguished from live RC by the FC over SBUS alone.  PRE is only a
+         * diagnostic hint based on the observed 1000/1000/1000 channel preset.
+         * It must NOT be used as a substitute for receiver failsafe flags. */
+        const bool rx_fresh = (debug_frames_ok > 0u) && (debug_age_ms < SBUS_LINK_TIMEOUT_MS);
+        const bool lost_flag = ((debug_sbus_flags & SBUS_FLAG_FRAME_LOST) != 0u);
+        const bool failsafe_flag = ((debug_sbus_flags & SBUS_FLAG_FAILSAFE) != 0u);
+        const uint8_t fs_reason = failsafe_flag ? 3u :
+                                  (lost_flag ? 2u : (rx_fresh ? 0u : 1u));
+        const bool preset_triplet = rx_fresh &&
+            (debug_roll >= 998u) && (debug_roll <= 1002u) &&
+            (debug_pitch >= 998u) && (debug_pitch <= 1002u) &&
+            (debug_yaw >= 998u) && (debug_yaw <= 1002u);
         last_log_ms = now;
-        log_async("V%lu L=%u RC=%u/%u/%u R=%ld P=%ld G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u%u%u%u LK=%u\r\n",
+        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u%u%u%u LK=%u\r\n",
                   (unsigned long)(++log_sequence),
-                  debug_link_ok ? 1u : 0u,
+                  rx_fresh ? 1u : 0u, debug_link_ok ? 1u : 0u,
+                  (unsigned)fs_reason, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
+                  preset_triplet ? 1u : 0u,
+                  (unsigned)debug_arm, (unsigned)debug_kill, (unsigned)debug_throttle,
                   (unsigned)debug_roll, (unsigned)debug_pitch, (unsigned)debug_yaw,
+                  rc_neutral ? 1u : 0u,
+                  (long)(sensor_roll_angle * 100.0f), (long)(sensor_pitch_angle * 100.0f),
                   (long)(roll_angle * 100.0f), (long)(pitch_angle * 100.0f),
+                  level_and_still ? 1u : 0u,
                   (long)(gyro_x_rate_dps()*10.0f),
                   (long)(gyro_y_rate_dps()*10.0f),
                   (long)(gyro_z_rate_dps()*10.0f),
@@ -894,7 +930,6 @@ void uav_test_loop(void)
                   (unsigned)output_dshot[0], (unsigned)output_dshot[1],
                   (unsigned)output_dshot[2], (unsigned)output_dshot[3],
                   UAV_BENCH_ARM_LOCK);
-
     }
 
 }
