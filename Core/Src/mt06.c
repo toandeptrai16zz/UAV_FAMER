@@ -328,12 +328,14 @@ bool MT06_GetData(const MT06_HandleTypeDef *dev, MT06_Data *data)
         __enable_irq();
     }
 
+    /* No averaging in GetData: it may be called much faster than the sensor's
+       sample rate, which otherwise makes smoothing dependent on loop speed.
+       Return the most recent CRC-checked sample and evaluate its freshness. */
     now = HAL_GetTick();
     data->age_ms = data->sample_received ? (now - data->last_update_ms) : 0xFFFFFFFFu;
     data->initialized = dev->initialized;
     data->fresh = data->sample_received && (data->age_ms <= MT06_DATA_TIMEOUT_MS);
-    data->orientation_down =
-        (data->orientation == MT06_DEFAULT_ORIENTATION_DOWN);
+    data->orientation_down = (data->orientation == MT06_DEFAULT_ORIENTATION_DOWN);
 
     data->valid = data->fresh &&
                   data->orientation_down &&
