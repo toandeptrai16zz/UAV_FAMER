@@ -10,6 +10,7 @@
 #include "mt06.h"
 #include "flight_pid.h"
 #include "rc_input.h"
+#include "mc7re_guard.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -40,8 +41,8 @@ extern UART_HandleTypeDef huart3;
 #define PWM_OUTPUT_COUNT            4u
 #define TEST_MOTOR_MASK             0x0Fu
 
-#define THR_FILTER_ALPHA            0.30f
-#define SLEW_UP_RATIO_PER_S          5.0f
+/* V340: direct pilot throttle: no artificial smoothing or slow-up ramp.
+ * Keep normal DShot output bounds (0=stop, 48..2047=throttle) and safety gates. */
 
 /* ----------------------------- SBUS config ---------------------------- */
 #define SBUS_FRAME_SIZE             25u
@@ -87,21 +88,37 @@ extern UART_HandleTypeDef huart3;
 #define IMU_MAX_AGE_MS               20u
 #define SPI_TIMEOUT_MS              2u
 
+/* V334 yaw-response sign check (passive, no motor output). */
+#define YAW_CHECK_RATE_MIN_DPS   20.0f
+#define YAW_CHECK_RATE_MAX_DPS  180.0f
+#define YAW_CHECK_COUNT_TARGET  30u
+/* V333 body-axis check: empirical sign map from the four hand-tilt logs.
+ * Right lean => old sensor Pitch negative; nose down => old sensor Roll positive.
+ * This is a provisional map, NOT a fully verified IMU mounting rotation or
+ * qualification of rate feedback/motor torque. Only passive outputs allowed. */
 /* Bench attitude controller. Gain values are uncalibrated, NOT flight gains. */
 #define ENABLE_ATTITUDE_PID          1u
 /* Mount trim estimated from paired 0 and 180 degree readings on same floor spot.
  * Measurements are provisional; airframe stability and axis signs are not validated. */
 #define IMU_ROLL_MOUNT_TRIM_DEG     -2.13f
 #define IMU_PITCH_MOUNT_TRIM_DEG    -1.06f
-/* Require independent sign/motor-map verification before any ARM release. */
-#define UAV_MOTOR_MAP_VERIFIED       0u
-#define UAV_IMU_AXES_VERIFIED        0u
-/* Both throttle endpoints must be held with KILL ON + ARM OFF each boot. */
+/* SAFE DIAGNOSTIC BUILD: pilot flight ARM is locked. The current airframe's
+ * IMU-to-body signs, motor torque directions and loaded PID response have not
+ * been proven. Only the sequential propeller-off ESC scan is enabled. */
+#define UAV_EXPERIMENTAL_ARM_ENABLE  0u
+#define UAV_EXPERIMENTAL_MAX_DSHOT   DSHOT_THROTTLE_MAX  /* dormant while ARM is locked */
+#define UAV_ARM_MAX_ANGLE_DEG       8.0f
+#define UAV_ARM_MAX_RATE_DPS       15.0f
+/* Use already measured MC6C SBUS endpoints (40..1640) from rc_input.h.
+ * No full-throttle calibration sweep at every power-on. */
 #define UAV_THROTTLE_MAPPING_VERIFIED 1u
-/* Safety review: bench diagnostics ONLY. Do not arm motors until physical verification. */
+/* Re-arm only after 600 completed, uninterrupted DShot DMA frames (~0.6 s).
+ * A historical TX error counter is NOT a permanent lockout. */
+#define UAV_DSHOT_REARM_GOOD_FRAMES   600u
+/* Never unlock pilot throttle in this diagnostic package. */
 #define UAV_BENCH_ARM_LOCK           1u
-/* PASSIVE diagnostic: ESC power must be disconnected; no motor pulse. */
-#define UAV_PROPS_OFF_ESC_TEST        0u /* PASSIVE ONLY: outputs zero; no motor scan */
+/* One-motor-at-a-time ESC scan is enabled; REMOVE ALL PROPELLERS. */
+#define UAV_PROPS_OFF_ESC_TEST        1u
 /* One channel at a time, never two simultaneously. REMOVE ALL PROPELLERS. */
 #define UAV_BENCH_TEST_MOTOR_COUNT    4u
 #define UAV_BENCH_TEST_GAP_MS         500u
@@ -125,9 +142,16 @@ extern UART_HandleTypeDef huart3;
 #if UAV_PROPS_OFF_ESC_TEST && !UAV_BENCH_ARM_LOCK
 #error "PROPS-OFF test and unlocked flight ARM must never coexist"
 #endif
-/* Keep this patch strictly passive, including after manual config edits. */
-#if (UAV_BENCH_ARM_LOCK != 1u) || (UAV_PROPS_OFF_ESC_TEST != 0u)
-#error "V329 is a PROPS-OFF PASSIVE verification image: ARM must stay locked, ESC test disabled"
+/* Exactly one output mode may be selected. The diagnostic package defaults
+ * to the propeller-off scanner; flight ARM requires a separate reviewed build. */
+#if UAV_PROPS_OFF_ESC_TEST && (!UAV_BENCH_ARM_LOCK || UAV_EXPERIMENTAL_ARM_ENABLE)
+#error "Propeller-off scan requires pilot ARM locked and experimental ARM disabled"
+#endif
+#if (!UAV_PROPS_OFF_ESC_TEST) && (UAV_BENCH_ARM_LOCK || !UAV_EXPERIMENTAL_ARM_ENABLE)
+#error "No valid motor output mode selected"
+#endif
+#if (UAV_EXPERIMENTAL_MAX_DSHOT <= DSHOT_THROTTLE_MIN) || (UAV_EXPERIMENTAL_MAX_DSHOT > DSHOT_THROTTLE_MAX)
+#error "Invalid experiment output cap"
 #endif
 #define UAV_ENABLE_ALT_HOLD          0u
 #if UAV_ENABLE_ALT_HOLD
@@ -153,6 +177,11 @@ static uint16_t dshot_dma_buffer[DSHOT_DMA_CELLS][PWM_OUTPUT_COUNT];
 static volatile uint32_t dshot_tx_errors;
 static volatile uint32_t dshot_tx_done;
 static volatile uint8_t dshot_dma_error_pending;
+/* Count completed TX callbacks since the most recent error, not since boot.
+ * Keep the cumulative error counter for diagnosis; never clear it to fake health. */
+static uint32_t dshot_faults_observed;
+static uint32_t dshot_tx_done_at_fault;
+static bool dshot_tx_recovered;
 
 static void dshot_set_compare_zero(void);
 
@@ -176,7 +205,7 @@ static void dshot_dma_tx_error(DMA_HandleTypeDef *hdma)
 /* ------------------------ Bench UART logging ------------------------- */
 /* One owner, one persistent TX buffer. Do not reuse buffer until HAL reports
  * that the complete frame has left LPUART1. Never block the 1-ms motor loop. */
-static char log_buffer[288];
+static char log_buffer[640];
 static volatile uint8_t log_tx_inflight = 0u;
 static volatile uint32_t log_tx_done = 0u;
 static volatile uint32_t log_tx_dropped = 0u;
@@ -322,6 +351,12 @@ static bool mpu6500_calibrate_gyro(void)
 static float gyro_x_rate_dps(void) { return (float)(gyro_x - gyro_bias_x_raw) / GYRO_LSB_PER_DPS; }
 static float gyro_y_rate_dps(void) { return (float)(gyro_y - gyro_bias_y_raw) / GYRO_LSB_PER_DPS; }
 static float gyro_z_rate_dps(void) { return (float)(gyro_z - gyro_bias_z_raw) / GYRO_LSB_PER_DPS; }
+/* Provisional IMU -> frame axis/sign transform from physical tilt logs.
+ * Signed body rates must match signed body angles supplied to the PID.
+ * Yaw sign was previously checked by manually rotating the airframe. */
+static float body_roll_rate_dps(void)  { return -gyro_y_rate_dps(); }
+static float body_pitch_rate_dps(void) { return -gyro_x_rate_dps(); }
+static float body_yaw_rate_dps(void)   { return -gyro_z_rate_dps(); }
 
 static void update_attitude(uint32_t dt_ms)
 {
@@ -338,8 +373,13 @@ static void update_attitude(uint32_t dt_ms)
                         (1.0f-COMP_FILTER_ALPHA)*accel_roll;
     sensor_pitch_angle = COMP_FILTER_ALPHA * (sensor_pitch_angle + gyro_y_rate_dps()*dt) +
                          (1.0f-COMP_FILTER_ALPHA)*accel_pitch;
-    roll_angle = sensor_roll_angle - IMU_ROLL_MOUNT_TRIM_DEG;
-    pitch_angle = sensor_pitch_angle - IMU_PITCH_MOUNT_TRIM_DEG;
+    /* Floor trim is defined in the ORIGINAL sensor coordinate system.
+     * Convert only after trim so near-horizontal remains near (0,0).
+     * From hand-tilt observations: body Roll = -sensor Pitch; body Pitch = -sensor Roll.
+     * Do not use for unrestricted flight until rate mapping and force directions
+     * have been independently confirmed on the actual airframe. */
+    roll_angle  = -(sensor_pitch_angle - IMU_PITCH_MOUNT_TRIM_DEG);
+    pitch_angle = -(sensor_roll_angle  - IMU_ROLL_MOUNT_TRIM_DEG);
 }
 
 #if ENABLE_ATTITUDE_PID
@@ -434,12 +474,21 @@ static uint32_t debug_age_ms, debug_frames_ok, debug_frames_bad, debug_uart_erro
 static uint16_t debug_throttle, debug_roll, debug_pitch, debug_arm, debug_kill, debug_alt_ch;
 static uint16_t debug_yaw;
 static uint8_t debug_sbus_flags;
+static MC7RE_Guard mc7re_guard;
+static uint8_t debug_rf_guard_reason;
+static bool debug_rf_preset, debug_rf_latched;
 static bool debug_link_ok, debug_imu_ok, debug_throttle_cal_ok;
+/* V337: diagnostics ONLY: why ARM is not granted. No safety gate bypass. */
+static uint16_t debug_arm_blockers;
+static bool debug_arm_ready, debug_low_hold, debug_link_stable, debug_level_ok, debug_neutral_ok;
 static float debug_pid_roll, debug_pid_pitch, debug_pid_yaw, debug_pid_alt;
 static FlightPIDSampleHold pid_sample_hold;
 static float debug_mix[PWM_OUTPUT_COUNT];
+static float debug_base_command;
+static float debug_mixer_scale;
+static float debug_mixer_offset;
+static float debug_throttle_ratio;
 static uint16_t output_dshot[PWM_OUTPUT_COUNT] = {0u, 0u, 0u, 0u};
-static RCThrottleCalibration rc_throttle_cal;
 static bool bench_pulse_pending, bench_pulse_active, bench_pulse_consumed, bench_arm_prev;
 static uint32_t bench_prep_start_ms, bench_pulse_start_ms;
 static bool bench_prep_tracking;
@@ -448,6 +497,12 @@ static uint8_t debug_bench_state;  /* 0=idle 1=ready 2=active 3=complete 4=abort
 static uint16_t debug_bench_command; /* Actual motor test command, 0 when not active */
 static uint8_t debug_bench_motor; /* 0=none/gap, 1..4 = TIM3 CH1..4 */
 static uint32_t bench_tx_start_done, bench_last_dma_frames;
+/* YQ: 0=no directional evidence; 1=CW passed; 2=CCW passed;
+ * 3=both signed body-yaw response directions passed; 4=sign mismatch.
+ * This cannot verify motor reaction torque or flight gains. */
+static uint16_t yaw_check_cw_count, yaw_check_ccw_count;
+static uint8_t yaw_check_status;
+
 
 static void outputs_force_zero(void) { for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) output_dshot[i] = 0u; dshot_set_compare_zero(); }
 
@@ -469,7 +524,6 @@ static void motor_step(void)
     uint16_t ch_thr, ch_arm, ch_kill, ch_alt; bool link_ok, link_stable, throttle_low, stick_stable_low;
     bool arm_switch_on, kill_switch_on, imu_fresh, can_arm, throttle_cal_ok, alt_switch_on;
     float threshold = 0.0f, denominator, target_ratio = 0.0f;
-    float step_up = SLEW_UP_RATIO_PER_S * ((float)DSHOT_CONTROL_PERIOD_MS / 1000.0f);
     float pid_roll = 0.0f, pid_pitch = 0.0f, pid_yaw = 0.0f, pid_alt = 0.0f;
 
     sbus_snapshot(&frames_ok, &last_valid_ms, &frames_bad, &uart_errors, &flags, channels);
@@ -477,18 +531,63 @@ static void motor_step(void)
     if (dshot_dma_error_pending != 0u) {
         dshot_dma_error_pending = 0u; armed = false; arm_ready = false; spinning = false; throttle_ratio = 0.0f; outputs_force_zero();
     }
+    /* DMA may glitch once while disarmed. An earlier error is retained in DE
+     * but can be recovered after 600 consecutive successful frames. If the
+     * errors persist, this never reaches the required clean streak. A fresh
+     * fault still immediately disarms in callback / dshot_send_all. */
+    if (dshot_tx_errors != dshot_faults_observed) {
+        dshot_faults_observed = dshot_tx_errors;
+        dshot_tx_done_at_fault = dshot_tx_done;
+    }
+    dshot_tx_recovered =
+        ((uint32_t)(dshot_tx_done - dshot_tx_done_at_fault) >= UAV_DSHOT_REARM_GOOD_FRAMES) &&
+        (dshot_dma_error_pending == 0u);
 
     ch_thr = channels[CH_THR]; ch_arm = channels[CH_ARM]; ch_kill = channels[CH_KILL]; ch_alt = channels[CH_ALT_HOLD];
     age_ms = now - last_valid_ms;
 
-    link_ok = (frames_ok > 0u) && (age_ms < SBUS_LINK_TIMEOUT_MS) &&
-              ((flags & (SBUS_FLAG_FRAME_LOST | SBUS_FLAG_FAILSAFE)) == 0u);
+    /* MC7RE can retransmit a preset of 1000/1000/1000, THR=40, with
+     * SBUS flags unchanged even after RF loss.  Guard the inferred pattern
+     * separately from actual SBUS transport status; never call it proof of RF.
+     * A latched event revokes link_ok and disarms without automatic re-arm. */
+    {
+        uint8_t raw_reason = 0u;
+        bool raw_link;
+        bool safe_arm_off, safe_kill_on, rc_at_neutral, safe_throttle_low;
+        if ((frames_ok == 0u) || (age_ms >= SBUS_LINK_TIMEOUT_MS)) raw_reason = 1u;
+        else if ((flags & SBUS_FLAG_FAILSAFE) != 0u) raw_reason = 3u;
+        else if ((flags & SBUS_FLAG_FRAME_LOST) != 0u) raw_reason = 2u;
+        raw_link = (raw_reason == 0u);
+#if ARM_SWITCH_ACTIVE_HIGH
+        safe_arm_off = (ch_arm < ARM_SWITCH_THRESHOLD);
+#else
+        safe_arm_off = (ch_arm > ARM_SWITCH_THRESHOLD);
+#endif
+#if KILL_SWITCH_ACTIVE_HIGH
+        safe_kill_on = (ch_kill >= KILL_SWITCH_THRESHOLD);
+#else
+        safe_kill_on = (ch_kill <= KILL_SWITCH_THRESHOLD);
+#endif
+        rc_at_neutral = mc7re_near(channels[CH_ROLL], RC_ROLL_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+                        mc7re_near(channels[CH_PITCH], RC_PITCH_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+                        mc7re_near(channels[CH_YAW], RC_YAW_CENTER, MC7RE_NEUTRAL_TOL_RAW);
+        safe_throttle_low = RC_ThrottleIsLow(ch_thr);
+        mc7re_guard_update(&mc7re_guard, now, raw_reason,
+                           channels[CH_ROLL], channels[CH_PITCH],
+                           channels[CH_YAW], ch_thr,
+                           safe_arm_off && safe_kill_on && rc_at_neutral && safe_throttle_low);
+        link_ok = raw_link && !mc7re_guard.latched && !mc7re_guard.candidate;
+        debug_rf_guard_reason = mc7re_guard.reason;
+        debug_rf_preset = mc7re_guard.candidate;
+        debug_rf_latched = mc7re_guard.latched;
+    }
     if (link_ok && !link_prev) link_up_ms = now;
     link_prev = link_ok; link_stable = link_ok && ((now - link_up_ms) >= LINK_STABLE_MS);
 
     if (frames_ok > 0u) {
-        if (!throttle_filter_initialized) { throttle_filtered = (float)ch_thr; throttle_filter_initialized = true; }
-        else { throttle_filtered += THR_FILTER_ALPHA * ((float)ch_thr - throttle_filtered); }
+        /* Follow current SBUS throttle input without a low-pass ramp. */
+        throttle_filtered = (float)ch_thr;
+        throttle_filter_initialized = true;
     } else { throttle_filter_initialized = false; low_tracking = false; }
 
 #if ARM_SWITCH_ACTIVE_HIGH
@@ -501,13 +600,13 @@ static void motor_step(void)
 #else
     kill_switch_on = (ch_kill <= KILL_SWITCH_THRESHOLD);
 #endif
-    /* Endpoint confirmation requires receiver, KILL engaged, ARM released. */
-    RC_CalibrationObserve(&rc_throttle_cal, now,
-        link_ok && kill_switch_on && !arm_switch_on, ch_thr);
+    /* V338 SIMPLE ARM: use measured SBUS endpoints from rc_input.h.
+     * No full-high throttle sweep required on every boot.
+     * Retain strict low-throttle, valid raw range, IMU, link, KILL and
+     * explicit ARM-OFF -> ARM-ON checks below. */
     throttle_cal_ok = throttle_calibration_valid() &&
-                      RC_CalibrationComplete(&rc_throttle_cal) &&
-                      RC_ThrottleRawValid(ch_thr);
-    /* THRMAP_OK now reports confirmed endpoints, not a fixed compile flag. */
+                      RC_ThrottleRawValid(ch_thr) &&
+                      (UAV_THROTTLE_MAPPING_VERIFIED == 1u);
     alt_switch_on = (ch_alt >= ALT_HOLD_THRESHOLD); /* [THÊM MỚI] Đọc công tắc bám cây */
 
     throttle_low = link_ok && throttle_cal_ok && RC_ThrottleIsLow(ch_thr);
@@ -523,19 +622,58 @@ static void motor_step(void)
     stick_stable_low = low_tracking && ((now - low_since_ms) >= ARM_LOW_HOLD_MS);
 
     imu_fresh = imu_ready && imu_calibrated && ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS);
-#if ENABLE_ATTITUDE_PID
+/* The only permitted release is IMU-feedback mode with fresh sensors,
+     * a steady near-level craft and zero-rate neutral sticks at ARM time.
+     * Failsafe and KILL remain independent disarm gates below. */
     can_arm = imu_fresh && throttle_cal_ok && (UAV_BENCH_ARM_LOCK == 0u) &&
-              (UAV_MOTOR_MAP_VERIFIED != 0u) && (UAV_IMU_AXES_VERIFIED != 0u);
-#else
-    can_arm = throttle_cal_ok && (UAV_BENCH_ARM_LOCK == 0u) &&
-              (UAV_MOTOR_MAP_VERIFIED != 0u) && (UAV_IMU_AXES_VERIFIED != 0u);
-#endif
+              (UAV_EXPERIMENTAL_ARM_ENABLE == 1u);
+    const bool level_for_arm = isfinite(roll_angle) && isfinite(pitch_angle) &&
+              fabsf(roll_angle) <= UAV_ARM_MAX_ANGLE_DEG &&
+              fabsf(pitch_angle) <= UAV_ARM_MAX_ANGLE_DEG &&
+              fabsf(body_roll_rate_dps()) <= UAV_ARM_MAX_RATE_DPS &&
+              fabsf(body_pitch_rate_dps()) <= UAV_ARM_MAX_RATE_DPS &&
+              fabsf(body_yaw_rate_dps()) <= UAV_ARM_MAX_RATE_DPS;
+    const bool neutral_for_arm =
+              mc7re_near(channels[CH_ROLL], RC_ROLL_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+              mc7re_near(channels[CH_PITCH], RC_PITCH_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+              mc7re_near(channels[CH_YAW], RC_YAW_CENTER, MC7RE_NEUTRAL_TOL_RAW);
+
+    /* V338: independent condition monitor, before the actual state transition.
+     * BKL mask:
+     * 0x001 ESC init, 0x002 invalid RC link, 0x004 KILL engaged,
+     * 0x008 IMU stale/calibration, 0x010 throttle raw out of validated range,
+     * 0x020 link stabilization, 0x040 throttle not low/stable 500ms,
+     * 0x080 not level/still, 0x100 RC sticks off-center,
+     * 0x200 MC7RE failsafe guard, 0x400 DShot has not recovered after a fault.
+     * 0x800 ARM switch off (normal, not an error).
+     * This diagnostic does not change can_arm or motor output logic. */
+    debug_arm_blockers = 0u;
+    if (elapsed < ESC_INIT_MS) debug_arm_blockers |= 0x001u;
+    if (!link_ok) debug_arm_blockers |= 0x002u;
+    if (kill_switch_on) debug_arm_blockers |= 0x004u;
+    if (!imu_fresh) debug_arm_blockers |= 0x008u;
+    if (!throttle_cal_ok) debug_arm_blockers |= 0x010u;
+    if (!link_stable) debug_arm_blockers |= 0x020u;
+    if (!stick_stable_low) debug_arm_blockers |= 0x040u;
+    if (!level_for_arm) debug_arm_blockers |= 0x080u;
+    if (!neutral_for_arm) debug_arm_blockers |= 0x100u;
+    if (mc7re_guard.latched || mc7re_guard.candidate) debug_arm_blockers |= 0x200u;
+    if (!dshot_tx_recovered) debug_arm_blockers |= 0x400u;
+    if (!arm_switch_on) debug_arm_blockers |= 0x800u;
+    if (UAV_BENCH_ARM_LOCK != 0u) debug_arm_blockers |= 0x1000u;
+    debug_link_stable = link_stable;
+    debug_low_hold = stick_stable_low;
+    debug_level_ok = level_for_arm;
+    debug_neutral_ok = neutral_for_arm;
 
     if ((elapsed < ESC_INIT_MS) || !link_ok || kill_switch_on || !can_arm) {
         armed = false; arm_ready = false;
     } else if (!arm_switch_on) {
         armed = false; arm_ready = true;
-    } else if (!armed && arm_ready && link_stable && stick_stable_low) {
+    } else if (!armed && arm_ready && link_stable && stick_stable_low &&
+               level_for_arm && neutral_for_arm &&
+               !mc7re_guard.latched && !mc7re_guard.candidate &&
+               dshot_tx_recovered) {
         armed = true; throttle_zero = win_max; throttle_ratio = 0.0f; spinning = false;
         FlightPID_Reset(&flight_pid); FlightPIDSampleHold_Reset(&pid_sample_hold); alt_integral = 0.0f; alt_last_error = 0.0f;
         last_pid_ms = now; pid_last_sample_sequence = imu_sample_sequence;
@@ -548,6 +686,7 @@ static void motor_step(void)
         alt_hold_active = false; /* Tự động ngắt nếu mất cảm biến hoặc gạt công tắc xuống */
     }
 
+    debug_arm_ready = arm_ready;
     if (!armed) {
         spinning = false; throttle_ratio = 0.0f;
         FlightPID_Reset(&flight_pid); alt_integral = 0.0f;
@@ -582,8 +721,8 @@ static void motor_step(void)
                 if (denominator > 1.0f) target_ratio = (throttle_filtered - threshold) / denominator;
                 target_ratio = (target_ratio < 0.0f) ? 0.0f : ((target_ratio > 1.0f) ? 1.0f : target_ratio);
             }
-            if (target_ratio > throttle_ratio + step_up) throttle_ratio += step_up;
-            else throttle_ratio = target_ratio;
+            /* Direct mapping: no per-second software throttle-rise cap. */
+            throttle_ratio = target_ratio;
         }
     }
 
@@ -603,19 +742,43 @@ static void motor_step(void)
                     .yaw_rate_set_dps = RC_StickNormalized(channels[CH_YAW], RC_YAW_CENTER)*PID_YAW_RATE_LIMIT_DPS,
                     .roll_deg = roll_angle,
                     .pitch_deg = pitch_angle,
-                    .gyro_roll_dps = gyro_x_rate_dps(),
-                    .gyro_pitch_dps = gyro_y_rate_dps(),
-                    /* Body convention: positive yaw is clockwise viewed from above.
-                     * Measured raw GZ was negative for physical clockwise spin.
-                     * Convert raw sensor Z to body-positive-clockwise before rate feedback.
-                     * V328: passive verification only; never enables motor outputs. */
-                    .gyro_yaw_dps = -gyro_z_rate_dps(),
+                    .gyro_roll_dps = body_roll_rate_dps(),
+                    .gyro_pitch_dps = body_pitch_rate_dps(),
+                    /* Body convention: positive yaw clockwise viewed from above.
+                     * Preserve V328 manually observed negative sensor-Z sign. */
+                    .gyro_yaw_dps = body_yaw_rate_dps(),
                     .dt_s = (float)dt_ms/1000.0f,
                     .allow_integrator = armed && spinning
                 };
                 FlightPIDOutput out;
                 if (FlightPID_Step(&flight_pid, &in, &out)) {
                     (void)FlightPIDSampleHold_Store(&pid_sample_hold, &out, now);
+                    /* Evaluate only a HAND-ROTATED, nearly level frame, with
+                     * throttle low and explicit ARM OFF + KILL ON. Never affect
+                     * output or arming on the basis of this diagnostic. */
+                    if (yaw_check_status != 4u && link_ok && !arm_switch_on &&
+                        kill_switch_on && RC_ThrottleIsLow(ch_thr) &&
+                        mc7re_near(channels[CH_ROLL], RC_ROLL_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+                        mc7re_near(channels[CH_PITCH], RC_PITCH_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+                        mc7re_near(channels[CH_YAW], RC_YAW_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+                        (fabsf(roll_angle) < 12.0f) && (fabsf(pitch_angle) < 12.0f) &&
+                        (fabsf(in.gyro_roll_dps) < 35.0f) &&
+                        (fabsf(in.gyro_pitch_dps) < 35.0f) &&
+                        (fabsf(in.gyro_yaw_dps) >= YAW_CHECK_RATE_MIN_DPS) &&
+                        (fabsf(in.gyro_yaw_dps) <= YAW_CHECK_RATE_MAX_DPS)) {
+                        bool opposes_rotation = ((in.gyro_yaw_dps > 0.0f) && (out.yaw < -4.0f)) ||
+                                                ((in.gyro_yaw_dps < 0.0f) && (out.yaw > 4.0f));
+                        if (!opposes_rotation) {
+                            yaw_check_status = 4u;
+                        } else {
+                            if (in.gyro_yaw_dps > 0.0f && yaw_check_cw_count < YAW_CHECK_COUNT_TARGET)
+                                yaw_check_cw_count++;
+                            else if (in.gyro_yaw_dps < 0.0f && yaw_check_ccw_count < YAW_CHECK_COUNT_TARGET)
+                                yaw_check_ccw_count++;
+                            yaw_check_status = (uint8_t)((yaw_check_cw_count >= YAW_CHECK_COUNT_TARGET ? 1u : 0u) |
+                                                         (yaw_check_ccw_count >= YAW_CHECK_COUNT_TARGET ? 2u : 0u));
+                        }
+                    }
                 } else {
                     FlightPIDSampleHold_Reset(&pid_sample_hold);
                 }
@@ -635,47 +798,56 @@ static void motor_step(void)
     }
 #endif
 
-    /* TRỘN XUNG (MIXER) */
+    /* QUAD-X mixer with desaturation by collective shift. The old algorithm
+     * multiplied every PID correction by a headroom ratio. At base=2047,
+     * high_headroom became zero and all attitude corrections collapsed to 0.
+     * This version preserves differential torque authority and shifts the
+     * complete motor set into the legal DShot range. */
     {
         float base = 0.0f;
+        float mixed[PWM_OUTPUT_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float scale = 0.0f;
+        float offset = 0.0f;
         if (armed && spinning) {
             if (alt_hold_active) {
-                base = ALT_HOVER_THROTTLE + pid_alt; /* Dùng ga tự động + PID */
+                base = ALT_HOVER_THROTTLE + pid_alt;
             } else {
-                base = (float)DSHOT_THROTTLE_MIN + throttle_ratio * (float)(DSHOT_THROTTLE_MAX - DSHOT_THROTTLE_MIN);
+                base = (float)DSHOT_THROTTLE_MIN + throttle_ratio *
+                       (float)(DSHOT_THROTTLE_MAX - DSHOT_THROTTLE_MIN);
             }
-            if (base < (float)DSHOT_THROTTLE_MIN) base = (float)DSHOT_THROTTLE_MIN;
-            if (base > (float)DSHOT_THROTTLE_MAX) base = (float)DSHOT_THROTTLE_MAX;
+            base = clampf_local(base, (float)DSHOT_THROTTLE_MIN,
+                                (float)DSHOT_THROTTLE_MAX);
         }
 
         float correction[PWM_OUTPUT_COUNT];
         FlightPID_MixX(pid_roll, pid_pitch, pid_yaw, correction);
         for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) debug_mix[i] = correction[i];
-        float min_corr = correction[0]; float max_corr = correction[0]; float scale = 1.0f;
 
-        for (uint8_t i = 1u; i < PWM_OUTPUT_COUNT; ++i) { if (correction[i] < min_corr) min_corr = correction[i]; if (correction[i] > max_corr) max_corr = correction[i]; }
+        const bool mix_ok = (armed && spinning) &&
+            FlightPID_DesaturateMixer(base, correction,
+                (float)DSHOT_THROTTLE_MIN, (float)UAV_EXPERIMENTAL_MAX_DSHOT,
+                mixed, &scale, &offset);
 
-        if (armed && spinning) {
-            const float low_headroom = base - (float)DSHOT_THROTTLE_MIN;
-            const float high_headroom = (float)DSHOT_THROTTLE_MAX - base;
-            if ((min_corr < 0.0f) && (-min_corr > low_headroom)) scale = low_headroom / (-min_corr);
-            if ((max_corr > 0.0f) && (max_corr > high_headroom)) { const float high_scale = high_headroom / max_corr; if (high_scale < scale) scale = high_scale; }
-            if (scale < 0.0f) scale = 0.0f;
-            if (scale > 1.0f) scale = 1.0f;
-        } else {
-            scale = 0.0f;
-        }
+        debug_base_command = base;
+        debug_mixer_scale = mix_ok ? scale : 0.0f;
+        debug_mixer_offset = mix_ok ? offset : 0.0f;
+        debug_throttle_ratio = throttle_ratio;
 
         for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) {
-            if (armed && spinning && ((TEST_MOTOR_MASK >> i) & 1u) != 0u) {
-                float value = base + correction[i] * scale;
-                if (value < (float)DSHOT_THROTTLE_MIN) value = (float)DSHOT_THROTTLE_MIN;
-                if (value > (float)DSHOT_THROTTLE_MAX) value = (float)DSHOT_THROTTLE_MAX;
-                output_dshot[i] = (uint16_t)(value + 0.5f);
+            if (mix_ok && ((TEST_MOTOR_MASK >> i) & 1u) != 0u) {
+                output_dshot[i] = (uint16_t)(mixed[i] + 0.5f);
             } else {
                 output_dshot[i] = 0u;
             }
         }
+    }
+
+    /* Flight mixer is released ONLY while the already-guarded state machine
+     * holds ARM+SPIN and live IMU+SBUS.  Kill and inferred MC7RE failsafe
+     * revoke armed above; this last barrier is defense in depth. */
+    if (!armed || !spinning || !imu_fresh || !link_ok || kill_switch_on ||
+        mc7re_guard.latched || mc7re_guard.candidate) {
+        outputs_force_zero();
     }
 
     /* PROPS-OFF TEST ONLY, flight ARM stays compile-time locked.
@@ -689,8 +861,15 @@ static void motor_step(void)
 #if UAV_PROPS_OFF_ESC_TEST
     {
         bool arm_rising = arm_switch_on && !bench_arm_prev;
+        bool neutral_sticks =
+            mc7re_near(channels[CH_ROLL], RC_ROLL_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+            mc7re_near(channels[CH_PITCH], RC_PITCH_CENTER, MC7RE_NEUTRAL_TOL_RAW) &&
+            mc7re_near(channels[CH_YAW], RC_YAW_CENTER, MC7RE_NEUTRAL_TOL_RAW);
         bool safe_inputs = link_stable && imu_fresh && throttle_cal_ok &&
-                           RC_ThrottleIsLow(ch_thr) && (elapsed >= ESC_INIT_MS) &&
+                           !mc7re_guard.latched && !mc7re_guard.candidate &&
+                           RC_ThrottleIsLow(ch_thr) && neutral_sticks &&
+                           (fabsf(roll_angle) < 10.0f) && (fabsf(pitch_angle) < 10.0f) &&
+                           (elapsed >= ESC_INIT_MS) &&
                            (dshot_tx_errors == 0u) &&
                            (dshot_dma_error_pending == 0u);
         uint32_t pulse_age;
@@ -766,9 +945,8 @@ static void motor_step(void)
     debug_bench_motor = 0u;
 #endif
 
-    /* V327 PASSIVE sign check: never send nonzero motor commands. */
-    outputs_force_zero();
-
+    /* V335: guarded pilot-throttle attitude mixer.  Neither SBUS transport
+     * nor this code proves RF is present when MC7RE repeats old channels. */
     if (!dshot_send_all(output_dshot)) {
         armed = false; arm_ready = false; spinning = false; throttle_ratio = 0.0f; outputs_force_zero();
 #if UAV_PROPS_OFF_ESC_TEST
@@ -798,11 +976,14 @@ void uav_test_init(void)
     htim3.Instance->DCR = TIM_DMABASE_CCR1 | TIM_DMABURSTLENGTH_4TRANSFERS;
     __HAL_TIM_SET_COUNTER(&htim3, 0u); outputs_force_zero(); htim3.Instance->EGR = TIM_EGR_UG; __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
 
+    mc7re_guard_init(&mc7re_guard);
+    debug_rf_guard_reason = 5u; debug_rf_preset = false; debug_rf_latched = true;
     armed = false; arm_ready = false; spinning = false; link_prev = false; throttle_filter_initialized = false; low_tracking = false;
     throttle_ratio = 0.0f; imu_read_errors = 0u; imu_last_good_ms = 0u; imu_sample_sequence = 0u; pid_last_sample_sequence = 0u;
-    dshot_tx_errors = 0u; dshot_tx_done = 0u; dshot_dma_error_pending = 0u; sbus_frame_pos = 0u; sbus_rx_rearm_pending = 1u;
+    dshot_tx_errors = 0u; dshot_tx_done = 0u; dshot_dma_error_pending = 0u;
+    dshot_faults_observed = 0u; dshot_tx_done_at_fault = 0u; dshot_tx_recovered = false;
+    sbus_frame_pos = 0u; sbus_rx_rearm_pending = 1u;
     FlightPID_Reset(&flight_pid); FlightPIDSampleHold_Reset(&pid_sample_hold);
-    RC_CalibrationReset(&rc_throttle_cal);
     bench_pulse_pending = false; bench_pulse_active = false;
     bench_pulse_consumed = false; bench_prep_tracking = false;
     bench_arm_prev = false;
@@ -810,7 +991,10 @@ void uav_test_init(void)
     debug_bench_command = 0u;
     debug_bench_motor = 0u;
     bench_tx_start_done = 0u; bench_last_dma_frames = 0u;
+    yaw_check_cw_count = 0u; yaw_check_ccw_count = 0u; yaw_check_status = 0u;
     alt_integral = 0.0f; roll_angle = 0.0f; pitch_angle = 0.0f;
+    debug_base_command = 0.0f; debug_mixer_scale = 0.0f;
+    debug_mixer_offset = 0.0f; debug_throttle_ratio = 0.0f;
     sensor_roll_angle = 0.0f; sensor_pitch_angle = 0.0f; attitude_initialized = false; alt_hold_active = false;
 
     barometer_ready = DPS310_Init(&barometer, &hi2c1, DPS310_I2C_ADDR_DEFAULT);
@@ -834,7 +1018,9 @@ void uav_test_init(void)
     if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 
     boot_ms = HAL_GetTick(); sbus_service_receive_restart();
-    log_async("V330 SBUS_FAILSAFE_DIAG: C=952/1062/1099; TRIM=-213/-106 centideg; LOCK=1 ESC_TEST=0; IMU=%u CAL=%u\r\n",
+    log_async("BENCH_PROPS_OFF: ARM_LOCK=%u SCAN=%u IMU=%u CAL=%u\r\n",
+              (unsigned)UAV_BENCH_ARM_LOCK,
+              (unsigned)UAV_PROPS_OFF_ESC_TEST,
               imu_ready ? 1u : 0u, imu_calibrated ? 1u : 0u);
 }
 
@@ -878,11 +1064,12 @@ void uav_test_loop(void)
     now = HAL_GetTick();
     (void)DPS310_GetData(&barometer, &baro_data);
 
-    /* V330: PASSIVE diagnostics of receiver failsafe, mount trim and RC neutral. These flags
-     * report only internal consistency; they do not prove physical level or flight readiness.
-     * S = sensor angle before trim; R/P = corrected body angle (x100 deg).
-     * N = RC inside deadband; LV = corrected angles/rates nearly level/stationary.
-     * Commands to every ESC remain ZERO and LOCK remains enabled.
+    /* V336: experimental throttle + PID motor output, full 2047 DShot range.
+     * Legacy bench scanner disabled at compile time. MC7RE guard retained.
+     * B=bench state,
+     * M=motor index (1..4), CMD=DShot value, TX=DMA completions.
+     * O=actual DShot command vector, separated by '/'.
+     * All propellers MUST be physically removed throughout this mode.
      */
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
         const bool rc_neutral = debug_link_ok &&
@@ -899,37 +1086,55 @@ void uav_test_loop(void)
          * A receiver that retransmits preset channels without flags cannot be
          * distinguished from live RC by the FC over SBUS alone.  PRE is only a
          * diagnostic hint based on the observed 1000/1000/1000 channel preset.
-         * It must NOT be used as a substitute for receiver failsafe flags. */
+         * The inferred preset now REVOKES link_ok after debounce and LATCHES
+         * the output lock; this is still NOT reliable RF telemetry. */
         const bool rx_fresh = (debug_frames_ok > 0u) && (debug_age_ms < SBUS_LINK_TIMEOUT_MS);
         const bool lost_flag = ((debug_sbus_flags & SBUS_FLAG_FRAME_LOST) != 0u);
         const bool failsafe_flag = ((debug_sbus_flags & SBUS_FLAG_FAILSAFE) != 0u);
         const uint8_t fs_reason = failsafe_flag ? 3u :
                                   (lost_flag ? 2u : (rx_fresh ? 0u : 1u));
-        const bool preset_triplet = rx_fresh &&
-            (debug_roll >= 998u) && (debug_roll <= 1002u) &&
-            (debug_pitch >= 998u) && (debug_pitch <= 1002u) &&
-            (debug_yaw >= 998u) && (debug_yaw <= 1002u);
+        const bool preset_triplet = debug_rf_preset;
+        /* FS=4 is a persistent inferred-pattern latch, FS=5 is startup latch.
+         * Flags 0x04/0x08 and timeout remain independently visible. */
+        const uint8_t fs_guard = debug_rf_latched ? debug_rf_guard_reason : fs_reason;
         last_log_ms = now;
-        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u%u%u%u LK=%u\r\n",
+        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld\r\n",
                   (unsigned long)(++log_sequence),
                   rx_fresh ? 1u : 0u, debug_link_ok ? 1u : 0u,
-                  (unsigned)fs_reason, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
-                  preset_triplet ? 1u : 0u,
+                  (unsigned)fs_guard, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
+                  preset_triplet ? 1u : 0u, debug_rf_latched ? 1u : 0u,
                   (unsigned)debug_arm, (unsigned)debug_kill, (unsigned)debug_throttle,
                   (unsigned)debug_roll, (unsigned)debug_pitch, (unsigned)debug_yaw,
                   rc_neutral ? 1u : 0u,
                   (long)(sensor_roll_angle * 100.0f), (long)(sensor_pitch_angle * 100.0f),
                   (long)(roll_angle * 100.0f), (long)(pitch_angle * 100.0f),
                   level_and_still ? 1u : 0u,
-                  (long)(gyro_x_rate_dps()*10.0f),
-                  (long)(gyro_y_rate_dps()*10.0f),
-                  (long)(gyro_z_rate_dps()*10.0f),
+                  (long)(body_roll_rate_dps()*10.0f),
+                  (long)(body_pitch_rate_dps()*10.0f),
+                  (long)(body_yaw_rate_dps()*10.0f),
                   (long)debug_pid_roll, (long)debug_pid_pitch, (long)debug_pid_yaw,
                   (long)debug_mix[0], (long)debug_mix[1],
                   (long)debug_mix[2], (long)debug_mix[3],
                   (unsigned)output_dshot[0], (unsigned)output_dshot[1],
                   (unsigned)output_dshot[2], (unsigned)output_dshot[3],
-                  UAV_BENCH_ARM_LOCK);
+                  (unsigned)debug_bench_state, (unsigned)debug_bench_motor,
+                  (unsigned)debug_bench_command, (unsigned long)dshot_tx_done,
+                  (unsigned long)dshot_tx_errors, dshot_tx_recovered ? 1u : 0u,
+                  UAV_BENCH_ARM_LOCK, armed ? 1u : 0u, spinning ? 1u : 0u,
+                  (unsigned)UAV_EXPERIMENTAL_MAX_DSHOT,
+                  (unsigned)yaw_check_status,
+                  (unsigned)debug_arm_blockers, debug_arm_ready ? 1u : 0u,
+                  debug_throttle_cal_ok ? 1u : 0u,
+                  debug_link_stable ? 1u : 0u,
+                  debug_low_hold ? 1u : 0u,
+                  debug_level_ok ? 1u : 0u,
+                  debug_neutral_ok ? 1u : 0u,
+                  debug_imu_ok ? 1u : 0u,
+                  (unsigned)throttle_zero,
+                  (long)(debug_throttle_ratio * 1000.0f),
+                  (long)debug_base_command,
+                  (long)(debug_mixer_scale * 1000.0f),
+                  (long)debug_mixer_offset);
     }
 
 }

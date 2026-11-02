@@ -38,4 +38,11 @@ void FlightPIDSampleHold_Reset(FlightPIDSampleHold *hold);
 bool FlightPIDSampleHold_Store(FlightPIDSampleHold *hold, const FlightPIDOutput *output, uint32_t now_ms);
 bool FlightPIDSampleHold_Read(const FlightPIDSampleHold *hold, uint32_t now_ms, uint32_t max_age_ms, FlightPIDOutput *output);
 void FlightPID_MixX(float roll, float pitch, float yaw, float corrections[4]);
+/* Preserve differential control authority when collective thrust saturates.
+ * Outputs are shifted together into [min_command, max_command]; corrections are
+ * scaled only when their span cannot fit in the available command range. */
+bool FlightPID_DesaturateMixer(float collective, const float corrections[4],
+                               float min_command, float max_command,
+                               float outputs[4], float *applied_scale,
+                               float *collective_offset);
 #endif

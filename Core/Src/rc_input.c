@@ -5,7 +5,7 @@
 #define RC_LOW_ENDPOINT_MAX   80u
 #define RC_HIGH_ENDPOINT_MIN 1610u
 #define RC_THR_VALID_MIN      20u
-#define RC_THR_VALID_MAX    1680u
+#define RC_THR_VALID_MAX    1811u  /* SBUS high endpoint; throttle map still saturates at RC_THR_MAX_RAW */
 
 void RC_CalibrationReset(RCThrottleCalibration *cal) {
     if (!cal) return;

@@ -108,3 +108,59 @@ bool FlightPIDSampleHold_Read(const FlightPIDSampleHold *hold, uint32_t now_ms, 
     *output = hold->output;
     return true;
 }
+
+bool FlightPID_DesaturateMixer(float collective, const float corrections[4],
+                               float min_command, float max_command,
+                               float outputs[4], float *applied_scale,
+                               float *collective_offset) {
+    if (!corrections || !outputs || !isfinite(collective) ||
+        !isfinite(min_command) || !isfinite(max_command) ||
+        !(max_command > min_command)) {
+        return false;
+    }
+
+    float corr_min = corrections[0];
+    float corr_max = corrections[0];
+    if (!isfinite(corr_min)) return false;
+
+    for (unsigned i = 1; i < 4; ++i) {
+        if (!isfinite(corrections[i])) return false;
+        if (corrections[i] < corr_min) corr_min = corrections[i];
+        if (corrections[i] > corr_max) corr_max = corrections[i];
+    }
+
+    const float command_span = max_command - min_command;
+    const float correction_span = corr_max - corr_min;
+    float scale = 1.0f;
+    if (correction_span > command_span && correction_span > 0.0f) {
+        scale = command_span / correction_span;
+    }
+
+    const float mixed_min = collective + corr_min * scale;
+    const float mixed_max = collective + corr_max * scale;
+    const float low_shift = min_command - mixed_min;
+    const float high_shift = max_command - mixed_max;
+    float offset = 0.0f;
+
+    /* The scaled correction span now fits. Shift the entire motor set only
+       when needed; do not shrink all PID corrections just because collective
+       thrust is near one output rail. */
+    if (low_shift > 0.0f) {
+        offset = low_shift;
+    } else if (high_shift < 0.0f) {
+        offset = high_shift;
+    }
+
+    for (unsigned i = 0; i < 4; ++i) {
+        float value = collective + corrections[i] * scale + offset;
+        if (!isfinite(value)) return false;
+        if (value < min_command) value = min_command;
+        if (value > max_command) value = max_command;
+        outputs[i] = value;
+    }
+
+    if (applied_scale) *applied_scale = scale;
+    if (collective_offset) *collective_offset = offset;
+    return true;
+}
+
