@@ -65,10 +65,18 @@ bool FlightPID_Step(FlightPIDState *s, const FlightPIDInput *in, FlightPIDOutput
 
 void FlightPID_MixX(float roll, float pitch, float yaw, float c[4]) {
     if (!c) return;
-    c[0] = +pitch-roll+yaw;
-    c[1] = -pitch-roll-yaw;
-    c[2] = -pitch+roll+yaw;
-    c[3] = +pitch+roll-yaw;
+    /* Verified geometric placement (not verified IMU-axis signs):
+     * M1 front-left CCW, M2 front-right CW,
+     * M3 rear-left CW, M4 rear-right CCW.
+     * Coordinates assume positive roll = right-side-down,
+     * positive pitch = nose-up, positive yaw = clockwise from above.
+     * A positive axis correction commands the corresponding +torque;
+     * mount orientation must be validated with the passive tilt test.
+     */
+    c[0] = +roll +pitch +yaw; /* M1: front-left  CCW */
+    c[1] = -roll +pitch -yaw; /* M2: front-right CW  */
+    c[2] = +roll -pitch -yaw; /* M3: rear-left   CW  */
+    c[3] = -roll -pitch +yaw; /* M4: rear-right  CCW */
 }
 
 /* The DShot command loop and IMU sampling are not guaranteed to coincide.

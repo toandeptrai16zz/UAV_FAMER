@@ -2,6 +2,7 @@
 "./Core/Src/flight_pid.o"
 "./Core/Src/main.o"
 "./Core/Src/mt06.o"
+"./Core/Src/rc_input.o"
 "./Core/Src/stm32g4xx_hal_msp.o"
 "./Core/Src/stm32g4xx_it.o"
 "./Core/Src/syscalls.o"

@@ -1,0 +1,6 @@
+../Core/Src/rc_input.c:10:6:RC_CalibrationReset	2
+../Core/Src/rc_input.c:17:6:RC_ThrottleRawValid	3
+../Core/Src/rc_input.c:21:6:RC_ThrottleIsLow	3
+../Core/Src/rc_input.c:27:6:RC_CalibrationObserve	10
+../Core/Src/rc_input.c:44:6:RC_CalibrationComplete	4
+../Core/Src/rc_input.c:48:7:RC_StickNormalized	6

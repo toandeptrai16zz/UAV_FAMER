@@ -9,6 +9,7 @@ C_SRCS += \
 ../Core/Src/flight_pid.c \
 ../Core/Src/main.c \
 ../Core/Src/mt06.c \
+../Core/Src/rc_input.c \
 ../Core/Src/stm32g4xx_hal_msp.c \
 ../Core/Src/stm32g4xx_it.c \
 ../Core/Src/syscalls.c \
@@ -21,6 +22,7 @@ OBJS += \
 ./Core/Src/flight_pid.o \
 ./Core/Src/main.o \
 ./Core/Src/mt06.o \
+./Core/Src/rc_input.o \
 ./Core/Src/stm32g4xx_hal_msp.o \
 ./Core/Src/stm32g4xx_it.o \
 ./Core/Src/syscalls.o \
@@ -33,6 +35,7 @@ C_DEPS += \
 ./Core/Src/flight_pid.d \
 ./Core/Src/main.d \
 ./Core/Src/mt06.d \
+./Core/Src/rc_input.d \
 ./Core/Src/stm32g4xx_hal_msp.d \
 ./Core/Src/stm32g4xx_it.d \
 ./Core/Src/syscalls.d \
@@ -48,7 +51,7 @@ Core/Src/%.o Core/Src/%.su Core/Src/%.cyclo: ../Core/Src/%.c Core/Src/subdir.mk
 clean: clean-Core-2f-Src
 
 clean-Core-2f-Src:
-	-$(RM) ./Core/Src/dps310.cyclo ./Core/Src/dps310.d ./Core/Src/dps310.o ./Core/Src/dps310.su ./Core/Src/flight_pid.cyclo ./Core/Src/flight_pid.d ./Core/Src/flight_pid.o ./Core/Src/flight_pid.su ./Core/Src/main.cyclo ./Core/Src/main.d ./Core/Src/main.o ./Core/Src/main.su ./Core/Src/mt06.cyclo ./Core/Src/mt06.d ./Core/Src/mt06.o ./Core/Src/mt06.su ./Core/Src/stm32g4xx_hal_msp.cyclo ./Core/Src/stm32g4xx_hal_msp.d ./Core/Src/stm32g4xx_hal_msp.o ./Core/Src/stm32g4xx_hal_msp.su ./Core/Src/stm32g4xx_it.cyclo ./Core/Src/stm32g4xx_it.d ./Core/Src/stm32g4xx_it.o ./Core/Src/stm32g4xx_it.su ./Core/Src/syscalls.cyclo ./Core/Src/syscalls.d ./Core/Src/syscalls.o ./Core/Src/syscalls.su ./Core/Src/sysmem.cyclo ./Core/Src/sysmem.d ./Core/Src/sysmem.o ./Core/Src/sysmem.su ./Core/Src/system_stm32g4xx.cyclo ./Core/Src/system_stm32g4xx.d ./Core/Src/system_stm32g4xx.o ./Core/Src/system_stm32g4xx.su ./Core/Src/uav_test.cyclo ./Core/Src/uav_test.d ./Core/Src/uav_test.o ./Core/Src/uav_test.su
+	-$(RM) ./Core/Src/dps310.cyclo ./Core/Src/dps310.d ./Core/Src/dps310.o ./Core/Src/dps310.su ./Core/Src/flight_pid.cyclo ./Core/Src/flight_pid.d ./Core/Src/flight_pid.o ./Core/Src/flight_pid.su ./Core/Src/main.cyclo ./Core/Src/main.d ./Core/Src/main.o ./Core/Src/main.su ./Core/Src/mt06.cyclo ./Core/Src/mt06.d ./Core/Src/mt06.o ./Core/Src/mt06.su ./Core/Src/rc_input.cyclo ./Core/Src/rc_input.d ./Core/Src/rc_input.o ./Core/Src/rc_input.su ./Core/Src/stm32g4xx_hal_msp.cyclo ./Core/Src/stm32g4xx_hal_msp.d ./Core/Src/stm32g4xx_hal_msp.o ./Core/Src/stm32g4xx_hal_msp.su ./Core/Src/stm32g4xx_it.cyclo ./Core/Src/stm32g4xx_it.d ./Core/Src/stm32g4xx_it.o ./Core/Src/stm32g4xx_it.su ./Core/Src/syscalls.cyclo ./Core/Src/syscalls.d ./Core/Src/syscalls.o ./Core/Src/syscalls.su ./Core/Src/sysmem.cyclo ./Core/Src/sysmem.d ./Core/Src/sysmem.o ./Core/Src/sysmem.su ./Core/Src/system_stm32g4xx.cyclo ./Core/Src/system_stm32g4xx.d ./Core/Src/system_stm32g4xx.o ./Core/Src/system_stm32g4xx.su ./Core/Src/uav_test.cyclo ./Core/Src/uav_test.d ./Core/Src/uav_test.o ./Core/Src/uav_test.su
 
 .PHONY: clean-Core-2f-Src
 

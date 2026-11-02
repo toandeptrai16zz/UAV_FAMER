@@ -21,9 +21,12 @@ typedef struct {
 typedef struct { float roll, pitch, yaw; } FlightPIDOutput;
 void FlightPID_Reset(FlightPIDState *state);
 bool FlightPID_Step(FlightPIDState *state, const FlightPIDInput *input, FlightPIDOutput *output);
-/* X layout assumes M1=front-right, M2=rear-right, M3=rear-left,
-   M4=front-left and spin signs +,-,+,-. MUST verify against real wiring.
-   Return values are corrections in DShot counts, NOT motor thrust. */
+/* User-confirmed quad X map (looking from above, nose forward):
+ * M1 front-left  CCW / PA6, M2 front-right CW  / PA4,
+ * M3 rear-left   CW  / PB0, M4 rear-right CCW / PB1.
+ * Mixer assumes +roll right-side-down, +pitch nose-up, +yaw clockwise.
+ * Physical IMU sign and torque response NOT YET VERIFIED.
+ * Outputs are relative DShot corrections, not measured thrust. */
 /* Retain the most recently calculated PID correction between IMU samples.
    A stale or invalid correction is never returned. Diagnostic only while locked. */
 typedef struct {

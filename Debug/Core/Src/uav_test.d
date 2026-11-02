@@ -36,7 +36,7 @@ Core/Src/uav_test.o: ../Core/Src/uav_test.c ../Core/Inc/main.h \
  ../Drivers/BSP/STM32G4xx_Nucleo/stm32g4xx_nucleo_errno.h \
  ../Core/Inc/stm32g4xx_nucleo_conf.h ../Core/Inc/uav_test.h \
  ../Core/Inc/dshot_protocol.h ../Core/Inc/dps310.h ../Core/Inc/mt06.h \
- ../Core/Inc/flight_pid.h
+ ../Core/Inc/flight_pid.h ../Core/Inc/rc_input.h
 ../Core/Inc/main.h:
 ../Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal.h:
 ../Core/Inc/stm32g4xx_hal_conf.h:
@@ -79,3 +79,4 @@ Core/Src/uav_test.o: ../Core/Src/uav_test.c ../Core/Inc/main.h \
 ../Core/Inc/dps310.h:
 ../Core/Inc/mt06.h:
 ../Core/Inc/flight_pid.h:
+../Core/Inc/rc_input.h:
