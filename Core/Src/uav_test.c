@@ -96,17 +96,18 @@ extern UART_HandleTypeDef huart3;
  * Right lean => old sensor Pitch negative; nose down => old sensor Roll positive.
  * This is a provisional map, NOT a fully verified IMU mounting rotation or
  * qualification of rate feedback/motor torque. Only passive outputs allowed. */
-/* Bench attitude controller. Gain values are uncalibrated, NOT flight gains. */
+/* Candidate attitude controller. Gains are initial/unvalidated and require controlled response checks. */
 #define ENABLE_ATTITUDE_PID          1u
 /* Mount trim estimated from paired 0 and 180 degree readings on same floor spot.
  * Measurements are provisional; airframe stability and axis signs are not validated. */
 #define IMU_ROLL_MOUNT_TRIM_DEG     -2.13f
 #define IMU_PITCH_MOUNT_TRIM_DEG    -1.06f
-/* SAFE DIAGNOSTIC BUILD: pilot flight ARM is locked. The current airframe's
- * IMU-to-body signs, motor torque directions and loaded PID response have not
- * been proven. Only the sequential propeller-off ESC scan is enabled. */
-#define UAV_EXPERIMENTAL_ARM_ENABLE  0u
-#define UAV_EXPERIMENTAL_MAX_DSHOT   DSHOT_THROTTLE_MAX  /* dormant while ARM is locked */
+/* FLIGHT CANDIDATE BUILD.
+ * The bench scanner is compiled out and the pilot ARM state machine is enabled.
+ * This does NOT certify motor order/direction or PID tuning: complete the
+ * propeller-off mixer/axis checks in FLIGHT_CANDIDATE_VI.md first. */
+#define UAV_EXPERIMENTAL_ARM_ENABLE  1u
+#define UAV_EXPERIMENTAL_MAX_DSHOT   DSHOT_THROTTLE_MAX  /* full pilot throttle range */
 #define UAV_ARM_MAX_ANGLE_DEG       8.0f
 #define UAV_ARM_MAX_RATE_DPS       15.0f
 /* Use already measured MC6C SBUS endpoints (40..1640) from rc_input.h.
@@ -115,10 +116,10 @@ extern UART_HandleTypeDef huart3;
 /* Re-arm only after 600 completed, uninterrupted DShot DMA frames (~0.6 s).
  * A historical TX error counter is NOT a permanent lockout. */
 #define UAV_DSHOT_REARM_GOOD_FRAMES   600u
-/* Never unlock pilot throttle in this diagnostic package. */
-#define UAV_BENCH_ARM_LOCK           1u
-/* One-motor-at-a-time ESC scan is enabled; REMOVE ALL PROPELLERS. */
-#define UAV_PROPS_OFF_ESC_TEST        1u
+/* Flight candidate: normal pilot ARM is enabled; bench lock is disabled. */
+#define UAV_BENCH_ARM_LOCK           0u
+/* Sequential props-off ESC scanner is disabled in this flight candidate. */
+#define UAV_PROPS_OFF_ESC_TEST        0u
 /* One channel at a time, never two simultaneously. REMOVE ALL PROPELLERS. */
 #define UAV_BENCH_TEST_MOTOR_COUNT    4u
 #define UAV_BENCH_TEST_GAP_MS         500u
@@ -205,7 +206,7 @@ static void dshot_dma_tx_error(DMA_HandleTypeDef *hdma)
 /* ------------------------ Bench UART logging ------------------------- */
 /* One owner, one persistent TX buffer. Do not reuse buffer until HAL reports
  * that the complete frame has left LPUART1. Never block the 1-ms motor loop. */
-static char log_buffer[640];
+static char log_buffer[896];
 static volatile uint8_t log_tx_inflight = 0u;
 static volatile uint32_t log_tx_done = 0u;
 static volatile uint32_t log_tx_dropped = 0u;
@@ -246,6 +247,9 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 static int16_t accel_x, accel_y, accel_z;
 static int16_t gyro_x, gyro_y, gyro_z;
 static bool imu_ready, imu_calibrated;
+/* A successful SPI transfer alone does not prove attitude continuity. */
+static bool imu_control_valid;
+static uint32_t imu_gap_count, imu_dt_max_ms, motor_dt_max_ms, motor_late_count;
 static DPS310_HandleTypeDef barometer;
 static bool barometer_ready;
 static MT06_HandleTypeDef rangefinder;
@@ -293,6 +297,8 @@ static bool mpu6500_init_spi(void)
     if (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) return false;
     if (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) return false;
     if (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK) return false;
+    /* ACCEL_CONFIG2: 41 Hz DLPF, 1 kHz output (TDK register map). */
+    if (mpu_write_reg(0x1Du, 0x03u) != HAL_OK) return false;
     HAL_Delay(10u); return true;
 }
 
@@ -369,10 +375,14 @@ static void update_attitude(uint32_t dt_ms)
         sensor_roll_angle = accel_roll; sensor_pitch_angle = accel_pitch;
         attitude_initialized = true;
     }
-    sensor_roll_angle = COMP_FILTER_ALPHA * (sensor_roll_angle + gyro_x_rate_dps()*dt) +
-                        (1.0f-COMP_FILTER_ALPHA)*accel_roll;
-    sensor_pitch_angle = COMP_FILTER_ALPHA * (sensor_pitch_angle + gyro_y_rate_dps()*dt) +
-                         (1.0f-COMP_FILTER_ALPHA)*accel_pitch;
+    /* Preserve the original 0.98 weight at 1 ms; keep the same decay time
+     * when a sample takes 2..20 ms. This does not reject linear acceleration. */
+    const float alpha = (dt_ms == 1u) ? COMP_FILTER_ALPHA :
+                        powf(COMP_FILTER_ALPHA, (float)dt_ms);
+    sensor_roll_angle = alpha * (sensor_roll_angle + gyro_x_rate_dps()*dt) +
+                        (1.0f-alpha)*accel_roll;
+    sensor_pitch_angle = alpha * (sensor_pitch_angle + gyro_y_rate_dps()*dt) +
+                         (1.0f-alpha)*accel_pitch;
     /* Floor trim is defined in the ORIGINAL sensor coordinate system.
      * Convert only after trim so near-horizontal remains near (0,0).
      * From hand-tilt observations: body Roll = -sensor Pitch; body Pitch = -sensor Roll.
@@ -467,6 +477,7 @@ static bool dshot_send_all(const uint16_t command[PWM_OUTPUT_COUNT]) {
 /* ----------------------------- Motor control -------------------------- */
 static uint32_t boot_ms;
 static bool armed, arm_ready, spinning, link_prev, throttle_filter_initialized, low_tracking, alt_hold_active;
+static bool arm_switch_prev;
 static uint32_t link_up_ms, low_since_ms;
 static uint16_t win_min, win_max, throttle_zero;
 static float throttle_filtered, throttle_ratio;
@@ -600,6 +611,8 @@ static void motor_step(void)
 #else
     kill_switch_on = (ch_kill <= KILL_SWITCH_THRESHOLD);
 #endif
+    const bool arm_rising = arm_switch_on && !arm_switch_prev;
+    arm_switch_prev = arm_switch_on;
     /* V338 SIMPLE ARM: use measured SBUS endpoints from rc_input.h.
      * No full-high throttle sweep required on every boot.
      * Retain strict low-throttle, valid raw range, IMU, link, KILL and
@@ -621,7 +634,8 @@ static void motor_step(void)
     }
     stick_stable_low = low_tracking && ((now - low_since_ms) >= ARM_LOW_HOLD_MS);
 
-    imu_fresh = imu_ready && imu_calibrated && ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS);
+    imu_fresh = imu_ready && imu_calibrated && imu_control_valid &&
+                attitude_initialized && ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS);
 /* The only permitted release is IMU-feedback mode with fresh sensors,
      * a steady near-level craft and zero-rate neutral sticks at ARM time.
      * Failsafe and KILL remain independent disarm gates below. */
@@ -670,7 +684,7 @@ static void motor_step(void)
         armed = false; arm_ready = false;
     } else if (!arm_switch_on) {
         armed = false; arm_ready = true;
-    } else if (!armed && arm_ready && link_stable && stick_stable_low &&
+    } else if (!armed && arm_rising && arm_ready && link_stable && stick_stable_low &&
                level_for_arm && neutral_for_arm &&
                !mc7re_guard.latched && !mc7re_guard.candidate &&
                dshot_tx_recovered) {
@@ -678,6 +692,10 @@ static void motor_step(void)
         FlightPID_Reset(&flight_pid); FlightPIDSampleHold_Reset(&pid_sample_hold); alt_integral = 0.0f; alt_last_error = 0.0f;
         last_pid_ms = now; pid_last_sample_sequence = imu_sample_sequence;
     }
+
+    /* Consume every ON attempt, including a failed pre-arm. A held ON
+     * switch must never arm later when a condition becomes true. */
+    if (arm_switch_on) arm_ready = false;
 
     /* Kiểm tra điều kiện an toàn cho chế độ Bám ngọn cây */
     if ((UAV_ENABLE_ALT_HOLD != 0u) && armed && alt_switch_on && current_range_valid) {
@@ -732,7 +750,9 @@ static void motor_step(void)
     if (imu_fresh && link_ok) {
         uint32_t dt_ms = now - last_pid_ms;
         bool new_imu_sample = (imu_sample_sequence != pid_last_sample_sequence);
-        if (new_imu_sample) {
+        /* Millisecond timestamps can coincide when SPI crosses a tick.
+         * Keep the held output until time advances; dt==0 is not a dropout. */
+        if (new_imu_sample && dt_ms > 0u) {
             pid_last_sample_sequence = imu_sample_sequence;
             last_pid_ms = now;
             if (dt_ms > 0u && dt_ms <= IMU_MAX_AGE_MS) {
@@ -782,6 +802,9 @@ static void motor_step(void)
                 } else {
                     FlightPIDSampleHold_Reset(&pid_sample_hold);
                 }
+            } else {
+                FlightPID_Reset(&flight_pid);
+                FlightPIDSampleHold_Reset(&pid_sample_hold);
             }
         }
     } else {
@@ -794,6 +817,12 @@ static void motor_step(void)
             pid_roll = held.roll;
             pid_pitch = held.pitch;
             pid_yaw = held.yaw;
+        } else if (armed && spinning) {
+            /* Never silently fall back to equal open-loop motor commands
+             * after PID validation fails or its held result expires. */
+            armed = false; arm_ready = false; spinning = false;
+            throttle_ratio = 0.0f;
+            outputs_force_zero();
         }
     }
 #endif
@@ -978,7 +1007,9 @@ void uav_test_init(void)
 
     mc7re_guard_init(&mc7re_guard);
     debug_rf_guard_reason = 5u; debug_rf_preset = false; debug_rf_latched = true;
-    armed = false; arm_ready = false; spinning = false; link_prev = false; throttle_filter_initialized = false; low_tracking = false;
+    armed = false; arm_ready = false; arm_switch_prev = false; spinning = false; link_prev = false; throttle_filter_initialized = false; low_tracking = false;
+    imu_control_valid = false;
+    imu_gap_count = 0u; imu_dt_max_ms = 0u; motor_dt_max_ms = 0u; motor_late_count = 0u;
     throttle_ratio = 0.0f; imu_read_errors = 0u; imu_last_good_ms = 0u; imu_sample_sequence = 0u; pid_last_sample_sequence = 0u;
     dshot_tx_errors = 0u; dshot_tx_done = 0u; dshot_dma_error_pending = 0u;
     dshot_faults_observed = 0u; dshot_tx_done_at_fault = 0u; dshot_tx_recovered = false;
@@ -1018,9 +1049,11 @@ void uav_test_init(void)
     if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 
     boot_ms = HAL_GetTick(); sbus_service_receive_restart();
-    log_async("BENCH_PROPS_OFF: ARM_LOCK=%u SCAN=%u IMU=%u CAL=%u\r\n",
+    log_async("FLIGHT_CANDIDATE: ARM_ENABLE=%u ARM_LOCK=%u SCAN=%u ALT_HOLD=%u IMU=%u CAL=%u\r\n",
+              (unsigned)UAV_EXPERIMENTAL_ARM_ENABLE,
               (unsigned)UAV_BENCH_ARM_LOCK,
               (unsigned)UAV_PROPS_OFF_ESC_TEST,
+              (unsigned)UAV_ENABLE_ALT_HOLD,
               imu_ready ? 1u : 0u, imu_calibrated ? 1u : 0u);
 }
 
@@ -1036,7 +1069,20 @@ void uav_test_loop(void)
         last_imu_ms = now;
         if (mpu6500_read_spi() && imu_calibrated) {
             uint32_t sample_now = HAL_GetTick(); uint32_t attitude_dt = sample_now - last_attitude_update_ms;
-            if ((attitude_dt > 0u) && (attitude_dt <= IMU_MAX_AGE_MS)) update_attitude(attitude_dt);
+            if (attitude_dt > imu_dt_max_ms) imu_dt_max_ms = attitude_dt;
+            if ((attitude_dt > 0u) && (attitude_dt <= IMU_MAX_AGE_MS)) {
+                update_attitude(attitude_dt);
+                imu_control_valid = isfinite(roll_angle) && isfinite(pitch_angle);
+            } else if (attitude_dt > IMU_MAX_AGE_MS) {
+                /* Mark this recovery sample invalid BEFORE motor_step can
+                 * observe the newly refreshed SPI timestamp. Reinitialize on
+                 * the next timely sample; arming still requires a new edge. */
+                imu_control_valid = false;
+                attitude_initialized = false;
+                FlightPID_Reset(&flight_pid);
+                FlightPIDSampleHold_Reset(&pid_sample_hold);
+                imu_gap_count++;
+            }
             last_attitude_update_ms = sample_now;
         }
     }
@@ -1046,7 +1092,8 @@ void uav_test_loop(void)
     current_range_valid = false;
     current_vertical_range_cm = 0;
 
-    if (range_data.valid && imu_ready && imu_calibrated && ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS)) {
+    now = HAL_GetTick(); /* SPI may have crossed a tick; avoid unsigned age underflow. */
+    if (range_data.valid && imu_ready && imu_calibrated && imu_control_valid && ((now - imu_last_good_ms) <= IMU_MAX_AGE_MS)) {
         const float deg_to_rad = 0.01745329251994329577f;
         const float tilt_factor = cosf(roll_angle * deg_to_rad) * cosf(pitch_angle * deg_to_rad);
         if ((tilt_factor > 0.70f) && (tilt_factor <= 1.01f)) {
@@ -1058,18 +1105,26 @@ void uav_test_loop(void)
     }
 
     now = HAL_GetTick();
-    if ((now - last_motor_update_ms) >= DSHOT_CONTROL_PERIOD_MS) { last_motor_update_ms = now; motor_step(); }
+    if ((now - last_motor_update_ms) >= DSHOT_CONTROL_PERIOD_MS) {
+        /* Ignore the first interval from boot/calibration. Millisecond
+         * diagnostics detect missed ticks, not sub-ms timing jitter. */
+        if (last_motor_update_ms != 0u) {
+            const uint32_t interval = now - last_motor_update_ms;
+            if (interval > motor_dt_max_ms) motor_dt_max_ms = interval;
+            if (interval > DSHOT_CONTROL_PERIOD_MS) motor_late_count++;
+        }
+        last_motor_update_ms = now;
+        motor_step();
+    }
 
     if (barometer_ready) (void)DPS310_Update(&barometer);
     now = HAL_GetTick();
     (void)DPS310_GetData(&barometer, &baro_data);
 
-    /* V336: experimental throttle + PID motor output, full 2047 DShot range.
-     * Legacy bench scanner disabled at compile time. MC7RE guard retained.
-     * B=bench state,
-     * M=motor index (1..4), CMD=DShot value, TX=DMA completions.
-     * O=actual DShot command vector, separated by '/'.
-     * All propellers MUST be physically removed throughout this mode.
+    /* FLIGHT CANDIDATE telemetry.
+     * B/M/CMD are zero because the props-off scanner is compiled out.
+     * O is the actual DShot command vector. Do not use this candidate for
+     * powered flight until the propeller-off axis/mixer checks pass.
      */
     if ((now - last_log_ms) >= LOG_PERIOD_MS) {
         const bool rc_neutral = debug_link_ok &&
@@ -1098,7 +1153,7 @@ void uav_test_loop(void)
          * Flags 0x04/0x08 and timeout remain independently visible. */
         const uint8_t fs_guard = debug_rf_latched ? debug_rf_guard_reason : fs_reason;
         last_log_ms = now;
-        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld\r\n",
+        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu\r\n",
                   (unsigned long)(++log_sequence),
                   rx_fresh ? 1u : 0u, debug_link_ok ? 1u : 0u,
                   (unsigned)fs_guard, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
@@ -1134,7 +1189,10 @@ void uav_test_loop(void)
                   (long)(debug_throttle_ratio * 1000.0f),
                   (long)debug_base_command,
                   (long)(debug_mixer_scale * 1000.0f),
-                  (long)debug_mixer_offset);
+                  (long)debug_mixer_offset,
+                  (unsigned long)imu_dt_max_ms, (unsigned long)motor_dt_max_ms,
+                  (unsigned long)motor_late_count, (unsigned long)imu_gap_count,
+                  (unsigned long)imu_read_errors);
     }
 
 }

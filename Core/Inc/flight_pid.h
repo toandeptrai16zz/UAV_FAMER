@@ -22,7 +22,7 @@ typedef struct { float roll, pitch, yaw; } FlightPIDOutput;
 void FlightPID_Reset(FlightPIDState *state);
 bool FlightPID_Step(FlightPIDState *state, const FlightPIDInput *input, FlightPIDOutput *output);
 /* User-confirmed quad X map (looking from above, nose forward):
- * M1 front-left  CCW / PA6, M2 front-right CW  / PA4,
+ * M1 front-left  CCW / PA6, M2 front-right CW  / PA7,
  * M3 rear-left   CW  / PB0, M4 rear-right CCW / PB1.
  * Mixer assumes +roll right-side-down, +pitch nose-up, +yaw clockwise.
  * Physical IMU sign and torque response NOT YET VERIFIED.

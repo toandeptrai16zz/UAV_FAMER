@@ -1,5 +1,7 @@
-/* Bench-only two-loop controller. All gains are illustrative UNTUNED values.
- * Do NOT unlock motors based solely on model/simulation tuning. */
+/* Initial cascaded attitude/rate controller for FLIGHT CANDIDATE.
+ * ANGLE_KP and RATE_KP are provisional. RATE_KI and RATE_KD intentionally
+ * remain zero until real gyro noise, motor response and airframe dynamics are
+ * measured. This is not a validated/tuned flight PID. */
 #include "flight_pid.h"
 #include <math.h>
 #include <stddef.h>
