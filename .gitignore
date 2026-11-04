@@ -1,9 +1,95 @@
-build
-mx.scratch
-!.settings__pycache__/
-*.py[cod]
-Telemetry/GroundStation/*.csv
+# =============================================================================
+# UAV_DATN - STM32CubeIDE / CMake / ESP32-CAM PlatformIO / Python GroundStation
+# Keep source files, .ioc, linker scripts, CMakeLists.txt, platformio.ini,
+# partition CSV and documentation in Git. Ignore only generated/local files.
+# =============================================================================
 
-# Wireless bridge credentials are local; never commit them.
-Telemetry/ESP32_CAM/secrets.h
-Telemetry/ESP32_CAM/.pio/
+# STM32CubeIDE generated build folders (objects, maps, ELF, generated makefiles)
+Debug/
+Release/
+build/
+cmake-build-*/
+out/
+
+# CMake / Ninja transient files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# Generated compiler / linker outputs (also outside standard build folders)
+*.o
+*.obj
+*.d
+*.su
+*.cyclo
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.lst
+*.srec
+*.s19
+*.a
+*.gcda
+*.gcno
+*.gcov
+
+# PlatformIO build output and installed library caches
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE workspace caches & machine-specific settings
+.vscode/
+.idea/
+.metadata/
+.recommenders/
+.settings/
+mx.scratch/
+
+# Python caches, test output and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Runtime GroundStation data (keep Python source in Git)
+Telemetry/GroundStation/*.csv
+Telemetry/GroundStation/*.log
+Telemetry/GroundStation/logs/
+Telemetry/GroundStation/recordings/
+
+# Local credentials / firmware secrets (DO NOT COMMIT)
+.env
+.env.*
+!.env.example
+secrets.h
+wifi_secrets.h
+credentials.json
+secrets.json
+*.pem
+*.key
+
+# Backups and temporary files
+backup_code/
+*.bak
+*.tmp
+*.swp
+*.swo
+*.orig
+*.rej
+*~
+*.log
+.DS_Store
+Thumbs.db

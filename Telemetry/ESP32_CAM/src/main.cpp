@@ -1,5 +1,5 @@
 /* UAV telemetry + PID configuration bridge, ESP32-CAM AI-Thinker.
- * GPIO13 <- STM32 PA2 TX; GPIO14 -> STM32 PA3 RX (3.3V).
+ * GPIO13 <- STM32 LPUART1 TX (now PC1/A4); GPIO14 -> STM32 LPUART1 RX (now PC0/A5), 3.3V.
  * GPIO13/14 are shared with microSD and must not be used for SDMMC.
  * The MCU controls ARM/KILL/failsafe; Wi-Fi never drives motors.
  * Remote STM32 ROM flashing is disabled by default on the FC.
@@ -40,7 +40,7 @@ constexpr uint8_t FRAME_FLIGHT_LEN = 88;
 constexpr int ESP_OTA_BENCH_PIN = 2; // Ground GPIO2 for bench-service OTA without FC telemetry; no microSD.
 constexpr uint32_t ESP_OTA_BENCH_HOLD_MS = 3000;
 constexpr uint32_t ESP_OTA_REBOOT_DELAY_MS = 2200;
-constexpr char ESP_FW_VERSION[] = "UAV-ESP32-DIRECT-AP-v1";
+constexpr char ESP_FW_VERSION[] = "UAV-ESP32-DIRECT-AP-UI-v2";
 // CHANGE WIFI only when DISARMED / CONFIG_READY if valid STM32 telemetry exists.
 Preferences configNvs;
 String apSsid, apPassword, apiToken;
@@ -631,73 +631,124 @@ void apiEspOtaInfo() {
 }
 
 const char HOME_HTML[] PROGMEM = R"HTML(
-<!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>UAV Direct - PID / Telemetry / OTA</title>
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>UAV Flight Console | ESP32-CAM</title>
 <style>
-body{max-width:900px;margin:24px auto;padding:0 16px;background:#0b1220;color:#dfe9f8;font:15px system-ui}
-h1{font-size:25px}h2{font-size:18px;margin:3px 0 12px}
-.card{border:1px solid #354766;background:#132038;padding:18px;border-radius:12px;margin:14px 0}
-label{display:block;margin:8px 0} input,select{background:#23344c;color:white;padding:10px;border:1px solid #536783;border-radius:6px;max-width:100%;box-sizing:border-box;width:100%}
-button{padding:10px 14px;background:#2f6bb0;color:white;border:0;border-radius:6px;cursor:pointer;margin:4px 4px 4px 0}
-button.ghost{background:#354766}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-#msg{white-space:pre-wrap;background:#071123;border-radius:6px;padding:12px;min-height:35px;overflow-wrap:anywhere}
-small{color:#a5b5ce}.danger{color:#ffd59c}
+:root{color-scheme:dark;--bg:#080e1b;--panel:#111c30;--panel2:#15233a;--panel3:#0d1729;--line:#283a55;--line2:#354962;--text:#ecf3ff;--muted:#90a4bd;--sky:#58b9ff;--blue:#3b82f6;--mint:#4cdbb5;--amber:#ffbf68;--red:#ff7888;--shadow:0 18px 45px #02071265}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;min-height:100vh;background:radial-gradient(800px 360px at 77% -12%,#183c6b79,transparent 70%),radial-gradient(640px 480px at -5% 19%,#0f3e5370,transparent 75%),var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+a{color:#8dd4ff;text-decoration:none}a:hover{text-decoration:underline}button,input{font:inherit}button{cursor:pointer}button:disabled{opacity:.48;cursor:not-allowed;transform:none!important}.wrap{max-width:1190px;padding:0 24px 60px;margin:0 auto}
+.topbar{height:82px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2639517c;gap:15px}.brand{display:flex;align-items:center;gap:13px}.brand-mark{width:43px;height:43px;display:grid;place-items:center;border-radius:13px;background:linear-gradient(145deg,#2873ce,#35a5ad);box-shadow:0 6px 24px #1f83c53d}.brand-mark svg{width:26px;height:26px}.brand-name{font-size:19px;font-weight:800;letter-spacing:.055em}.brand-name em{font-style:normal;color:#72cafb}.brand-sub{font-size:10px;letter-spacing:.19em;color:var(--muted);font-weight:700}.top-right{display:flex;align-items:center;gap:11px}.pill{display:inline-flex;gap:7px;align-items:center;border-radius:30px;background:#16263b;border:1px solid #38546b;padding:7px 12px;color:#cbd9e9;font-size:11px;font-weight:800;letter-spacing:.045em;white-space:nowrap}.pill.good{color:#92ebc8;border-color:#286651;background:#0e352b}.pill.warn{color:#ffd4a0;border-color:#805c33;background:#382a1b}.pulse{width:7px;height:7px;background:#8298b3;border-radius:50%;display:inline-block;box-shadow:0 0 0 3px #8098b31c}.pill.good .pulse{background:#57dfad;box-shadow:0 0 0 3px #57dfad29}
+.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:22px;margin:36px 0 24px}.eyebrow{font-size:11px;letter-spacing:.18em;font-weight:800;color:#72c7f9;margin-bottom:9px}.hero h1{font-size:clamp(29px,3.3vw,43px);line-height:1.15;letter-spacing:-.042em;margin:0 0 10px}.hero p{margin:0;color:#a8b9cd;max-width:590px}.hero-tag{display:flex;align-items:center;gap:9px;border:1px solid var(--line);border-radius:13px;background:#0e1a2b;padding:11px 14px;white-space:nowrap}.hero-tag small{color:var(--muted);display:block;font-size:10px}.hero-tag b{display:block;letter-spacing:.02em}
+.safety{display:flex;align-items:center;gap:12px;border-radius:13px;background:#3c2b1945;border:1px solid #80603886;padding:13px 17px;margin-bottom:22px;color:#efc797;font-size:12px}.safety strong{color:#ffe0b2}.safety-icon{width:28px;height:28px;display:grid;place-items:center;flex:none;border-radius:9px;background:#6041227d;font-size:17px}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:21px}.metric{border:1px solid var(--line);border-radius:17px;padding:18px 18px 16px;background:linear-gradient(150deg,#16253b,#111b2e);box-shadow:0 9px 25px #040a1760;min-width:0;position:relative;overflow:hidden}.metric::after{content:"";position:absolute;right:-20px;top:-25px;width:95px;height:95px;border-radius:50%;background:radial-gradient(circle,#228fcd16,transparent 70%)}.metric-label{font-size:11px;font-weight:700;letter-spacing:.06em;color:#9aacc5;text-transform:uppercase}.metric-main{display:flex;align-items:baseline;gap:6px;margin-top:12px}.metric-value{font-size:30px;font-weight:800;letter-spacing:-.035em;line-height:1.12;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.metric-unit{font-size:12px;color:#829bb6}.metric-foot{font-size:11px;color:#88a4bf;margin-top:10px}.metric-foot.ok{color:#70dab3}.metric-foot.alert{color:#ffc17c}
+.layout{display:grid;grid-template-columns:minmax(0,1.67fr) minmax(312px,1fr);gap:20px;align-items:start}.stack{display:flex;flex-direction:column;gap:20px;min-width:0}.panel{background:linear-gradient(180deg,#152239 0%,#101a2b 100%);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden}.panel-head{display:flex;align-items:start;justify-content:space-between;gap:15px;padding:23px 23px 20px;border-bottom:1px solid #293b51}.panel-head h2{font-size:18px;letter-spacing:-.018em;margin:0 0 5px}.panel-head p{margin:0;color:#8da3bc;font-size:12px}.panel-body{padding:22px 23px}.section-mark{width:34px;height:34px;border:1px solid #3a6486;background:#1b3e5b;border-radius:11px;display:grid;place-items:center;flex:none;color:#8cd6ff;font-weight:800;font-size:15px}.head-title{display:flex;gap:12px;align-items:center}.title-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.btn{min-height:38px;padding:9px 13px;display:inline-flex;align-items:center;justify-content:center;gap:7px;border-radius:9px;border:1px solid transparent;background:#27415e;color:#e6f0fb;font-weight:750;font-size:12px;transition:background .17s,transform .17s;white-space:nowrap}.btn:hover:not(:disabled){background:#355577;transform:translateY(-1px)}.btn.primary{background:linear-gradient(135deg,#3e9beb,#246ed0);box-shadow:0 4px 13px #187fe22a}.btn.primary:hover:not(:disabled){background:linear-gradient(135deg,#66b9f8,#297bda)}.btn.outline{background:#122239;border-color:#3e526c}.btn.outline:hover:not(:disabled){background:#1d3550}.btn.amber{background:#654521;border:1px solid #ae7a3e;color:#ffe2b8}.btn.amber:hover:not(:disabled){background:#85572a}.btn .ico{font-size:15px;line-height:1}
+.subhead{font-size:10px;letter-spacing:.15em;font-weight:850;color:#779fbd;text-transform:uppercase;margin:2px 0 14px}.pid-block{border-bottom:1px solid #26374a;padding-bottom:19px;margin-bottom:22px}.pid-block:last-of-type{border:0;margin-bottom:0;padding-bottom:0}.input-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.input-grid.limit{grid-template-columns:repeat(2,minmax(0,1fr))}.form-field{display:block;min-width:0}.form-field span{display:block;font-size:11px;color:#a7bbd2;margin-bottom:7px;font-weight:650}.form-field input{width:100%;height:43px;border-radius:10px;background:#0d182a;border:1px solid #34506b;color:#f0f6fe;padding:0 12px;outline:none;font-weight:680;font-size:14px;font-variant-numeric:tabular-nums;transition:border-color .15s,box-shadow .15s}.form-field input:hover:not(:disabled){border-color:#50738f}.form-field input:focus{border-color:#65b8ed;box-shadow:0 0 0 3px #429af129}.form-field input:disabled{color:#7c93ab;background:#101a2b;opacity:.85}.axis-row{display:grid;grid-template-columns:58px repeat(3,minmax(0,1fr));gap:10px;align-items:end;margin-bottom:12px}.axis-title{padding-bottom:13px;font-size:11px;letter-spacing:.075em;color:#aac3db;font-weight:850}.pid-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:19px;padding-top:18px;border-top:1px solid #2c3d52;flex-wrap:wrap}.help{color:#8fa6c0;font-size:11px}.checkbox{display:flex;align-items:flex-start;gap:10px;color:#b6c8da;font-size:12px;cursor:pointer}.checkbox input{width:17px;height:17px;accent-color:#3ba5e8;flex:none;margin:1px 0}.button-row{display:flex;flex-wrap:wrap;gap:9px;margin-top:18px}
+.auth-input{display:flex;gap:9px;align-items:stretch}.auth-input input{min-width:0;flex:1;height:43px;border-radius:10px;background:#0d182a;border:1px solid #344a64;color:#f0f6ff;padding:0 12px;outline:none;letter-spacing:.07em}.auth-input input:focus{border-color:var(--sky);box-shadow:0 0 0 3px #3fa6e826}.auth-note{color:#839db9;font-size:11px;margin:10px 0 0}.info-row{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-bottom:1px solid #29394a;font-size:12px}.info-row:last-child{border:0}.info-row span{color:#91a9c3}.info-row strong{font-weight:800;text-align:right;word-break:break-all}.info-row strong.green{color:#7ee3bd}.status-line{margin-top:17px;font-size:12px;color:#b5c8db;background:#0b1729;border:1px solid #2c415a;border-radius:11px;padding:11px 13px;min-height:43px}.status-line.error{color:#ffb8bc;border-color:#86414b}.status-line.success{color:#9eeac9;border-color:#326d56}
+.ota-state{font-size:12px;color:#b4c9df;background:#0d182b;border-radius:12px;border:1px solid #344860;padding:13px 14px;min-height:48px;margin-bottom:17px}.ota-state.good{border-color:#3f8c6d;color:#8de9c0}.ota-state.bad{border-color:#a26543;color:#ffd09e}.file-drop{display:block;border:1px dashed #557390;background:#101d31;border-radius:12px;padding:16px 13px;text-align:center;cursor:pointer}.file-drop:hover{border-color:#83c6f4;background:#132940}.file-drop input{width:100%;font-size:11px;max-width:100%;color:#b5c9e1}.file-drop input::file-selector-button{padding:8px 10px;border-radius:8px;background:#294765;color:#eaf4ff;border:1px solid #466787;cursor:pointer;margin-right:10px}.ota-small{font-size:11px;color:#96a8ba;margin-top:12px}.progress{height:5px;background:#243c55;border-radius:15px;overflow:hidden;margin:13px 0 0;display:none}.progress.active{display:block}.progress::before{content:"";display:block;width:35%;height:100%;border-radius:20px;background:linear-gradient(90deg,#36b3ed,#69dfba);animation:move 1.15s linear infinite}@keyframes move{from{transform:translateX(-120%)}to{transform:translateX(420%)}}
+.console{margin-top:21px;border:1px solid #293b53;border-radius:14px;background:#0b1526;padding:14px 17px}.console-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#7f9dbb;font-size:10px;font-weight:800;letter-spacing:.13em;margin-bottom:8px}.console pre{margin:0;white-space:pre-wrap;word-break:break-word;font:11px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;color:#c4d8ec;max-height:150px;overflow:auto}.muted{color:var(--muted)}.tiny{font-size:11px;color:#8297af}.footer{display:flex;justify-content:space-between;gap:12px;align-items:center;color:#718aa7;font-size:11px;padding-top:21px}.sr{position:absolute!important;height:1px;width:1px;overflow:hidden;clip:rect(0,0,0,0)}
+@media(max-width:990px){.layout{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.hero{margin-top:26px}}@media(max-width:610px){.wrap{padding:0 15px 36px}.topbar{height:71px}.brand-name{font-size:17px}.brand-sub{font-size:9px}.top-right .pill:last-child{display:none}.hero{display:block;margin:26px 0 20px}.hero-tag{margin-top:16px;display:inline-flex}.hero h1{font-size:30px}.safety{align-items:flex-start}.metric{padding:15px}.metrics{gap:10px}.metric-value{font-size:25px}.metric-label{font-size:10px}.panel-head{padding:18px 16px}.panel-body{padding:18px 16px}.axis-row{grid-template-columns:43px repeat(3,minmax(0,1fr));gap:7px}.axis-title{font-size:10px}.form-field input{padding:0 7px;font-size:12px}.form-field span{font-size:10px}.title-actions{justify-content:flex-start}.head-title{align-items:start}.footer{display:block}.footer span{display:block;margin-bottom:6px}}
 </style>
-<h1>UAV ESP32-CAM · Direct Wi-Fi</h1>
-<p class="danger">Wi-Fi phát trực tiếp, không dùng router. Thử trên bàn: tháo cánh, ngắt nguồn động lực, DISARM, KILL ON, CH8 CONFIG.</p>
-<section class="card">
-<h2>Quyền quản trị</h2>
-<label>API token (in trên Serial Monitor lần đầu)<input id="token" type="password" autocomplete="off" placeholder="Token quản trị ESP32"></label>
-<button onclick="init()">Kết nối & đọc trạng thái</button>
-<small>Token giữ trong tab đang mở, không tải lên dịch vụ bên ngoài.</small>
+</head>
+<body>
+<div class="wrap">
+<header class="topbar">
+  <div class="brand"><div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 28" fill="none" stroke="white" stroke-width="1.8"><path d="M14 2 3 8v12l11 6 11-6V8z"/><path d="m14 7 5 7-5 7-5-7z"/><path d="M3 8l6 6-6 6m22-12-6 6 6 6"/></svg></div><div><div class="brand-name">UAV <em>CONSOLE</em></div><div class="brand-sub">ESP32-CAM / FLIGHT LINK</div></div></div>
+  <div class="top-right"><span id="linkPill" class="pill"><i class="pulse"></i> CHƯA XÁC THỰC</span><span class="pill">DIRECT AP · 2.4 GHz</span></div>
+</header>
+<section class="hero"><div><div class="eyebrow">TRẠM GIÁM SÁT & CẤU HÌNH</div><h1>Flight Control Dashboard</h1><p>Giám sát đường truyền UART / UDP, đọc và điều chỉnh PID STM32, cập nhật firmware ESP32-CAM — tất cả qua Wi-Fi trực tiếp.</p></div><div class="hero-tag"><div style="font-size:20px;color:#77dfc2" aria-hidden="true">◉</div><div><small>ĐỊA CHỈ THIẾT BỊ</small><b>192.168.4.1</b></div></div></section>
+<div class="safety"><span class="safety-icon" aria-hidden="true">⚠</span><div><strong>Chỉ cấu hình trên bàn:</strong> tháo cánh quạt, ngắt nguồn động lực, ARM OFF, KILL ON, ga thấp, CH8 CONFIG ON. Wi-Fi 2.4 GHz có thể ảnh hưởng bộ thu RC cùng băng tần.</div></div>
+<section class="metrics" aria-label="Chỉ số đường truyền">
+  <article class="metric"><div class="metric-label">UART RX</div><div class="metric-main"><span id="mUart" class="metric-value">—</span></div><div id="fUart" class="metric-foot">Tổng số byte STM32 → ESP32</div></article>
+  <article class="metric"><div class="metric-label">Telemetry frames</div><div class="metric-main"><span id="mFrames" class="metric-value">—</span></div><div id="fFrames" class="metric-foot">Chưa đọc dữ liệu</div></article>
+  <article class="metric"><div class="metric-label">UDP chuyển tiếp</div><div class="metric-main"><span id="mUdp" class="metric-value">—</span></div><div id="fUdp" class="metric-foot">Cần Ground Station gửi HELLO</div></article>
+  <article class="metric"><div class="metric-label">CRC lỗi</div><div class="metric-main"><span id="mCrc" class="metric-value">—</span></div><div id="fCrc" class="metric-foot">Lỗi khung UART</div></article>
 </section>
-<section class="card">
-<h2>1. Kết nối trực tiếp</h2>
-<p>Thiết bị luôn phát mạng <strong>UAV-DIRECT-XXXXXX</strong>.</p>
-<p>Điện thoại/laptop kết nối mạng này rồi mở <a href="http://192.168.4.1/" style="color:#80bfff">http://192.168.4.1/</a>. Không cần Internet.</p>
-<p id="netinfo">Nhập API token và nhấn Kết nối để xem thông tin UART/telemetry.</p>
-<button onclick="wifiStatus()">Làm mới trạng thái</button>
-</section>
-<section class="card">
-<h2>2. Cập nhật firmware ESP32 qua Wi-Fi (OTA)</h2>
-<p class="danger">Chỉ thực hiện khi UAV tháo cánh, ngắt nguồn ESC, DISARM + KILL + CH8 CONFIG. Nếu STM32 không gửi telemetry, phải nối jumper GPIO2 → GND ít nhất 3 giây trên bàn; không dùng microSD.</p>
-<p id="espota_info">Chưa kiểm tra điều kiện ESP32 OTA.</p>
-<button onclick="espOtaInfo()">Kiểm tra OTA ESP32</button>
-<label>File ứng dụng ESP32 (firmware.bin)<input id="espbin" type="file" accept=".bin,application/octet-stream"></label>
-<button onclick="espOtaUpload()">Cập nhật ESP32</button>
-<small>Không tải bootloader.bin, partitions.bin hay .elf. Trình duyệt tự tính SHA-256; thiết bị kiểm tra lại trước khi chuyển vùng boot. Không tắt nguồn khi đang upload.</small>
-</section>
-<section class="card">
-<h2>3. PID (STM32)</h2>
-<p>Chỉ sử dụng khi <strong>ARM OFF · KILL ON · ga thấp · CH8 CONFIG ON</strong>.</p>
-<button onclick="loadPid()">Đọc PID</button><button onclick="applyPid()">Apply RAM</button><button onclick="savePid()">Save Flash</button>
-<div class="row" id="fields"></div><p><small>OTA STM32 chỉ dành cho test trên bàn và đang khóa từ firmware STM32 mặc định.</small></p>
-</section>
-<pre id="msg">Sẵn sàng.</pre>
+<div class="layout">
+ <div class="stack">
+   <section class="panel" id="pidPanel"><div class="panel-head"><div class="head-title"><span class="section-mark">01</span><div><h2>PID Tuning / STM32</h2><p>Đọc thông số hiện tại, áp dụng RAM hoặc lưu vào Flash.</p></div></div><div id="pidBadge" class="pill">CHƯA ĐỌC PID</div></div>
+     <div class="panel-body">
+       <div class="pid-block"><div class="subhead">Điều khiển góc và tốc độ</div><div class="input-grid" id="attitudeInputs"></div></div>
+       <div class="pid-block"><div class="subhead">Rate controller · Trục / Kp / Ki / Kd</div><div id="rateInputs"></div></div>
+       <div class="pid-block"><div class="subhead">Giới hạn bộ điều khiển</div><div class="input-grid limit" id="limitInputs"></div></div>
+       <label class="checkbox"><input id="benchConfirm" type="checkbox"><span>Tôi xác nhận đã <b>tháo cánh, ngắt nguồn động lực</b> và đặt STM32 ở trạng thái cấu hình an toàn.</span></label>
+       <div class="button-row"><button id="pidReadBtn" class="btn primary" onclick="loadPid()"><span class="ico">↻</span> Đọc PID</button><button id="pidApplyBtn" class="btn outline" onclick="applyPid()" disabled>Áp dụng RAM</button><button id="pidSaveBtn" class="btn amber" onclick="savePid()" disabled>Lưu Flash</button></div>
+       <div class="pid-foot"><span id="pidHint" class="help">Đọc PID để lấy thông số từ STM32.</span><span class="tiny">13 thông số · Không tự ghi Flash</span></div>
+     </div>
+   </section>
+ </div>
+ <aside class="stack">
+  <section class="panel"><div class="panel-head"><div class="head-title"><span class="section-mark">02</span><div><h2>Xác thực quản trị</h2><p>Token chỉ gửi tới ESP32-CAM cục bộ.</p></div></div></div><div class="panel-body">
+   <label for="token" class="subhead" style="display:block;margin:0 0 10px">API Token</label>
+   <div class="auth-input"><input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Nhập token quản trị"><button class="btn outline" type="button" onclick="toggleToken()" aria-label="Ẩn hoặc hiện token">◉</button></div>
+   <div class="button-row"><button class="btn primary" onclick="init()">Kết nối & đọc trạng thái</button><button class="btn outline" onclick="wifiStatus()">Làm mới</button></div>
+   <p class="auth-note">Lưu trong phiên của tab này. Không có dịch vụ đám mây hoặc truy cập Internet.</p>
+   <div class="status-line" id="authState">Chưa kết nối đến API quản trị.</div>
+  </div></section>
+  <section class="panel"><div class="panel-head"><div class="head-title"><span class="section-mark">03</span><div><h2>Đường truyền trực tiếp</h2><p>Wi-Fi nội bộ · không cần router.</p></div></div></div><div class="panel-body">
+   <div class="info-row"><span>Chế độ</span><strong id="apMode" class="green">DIRECT AP ONLY</strong></div>
+   <div class="info-row"><span>Tên mạng</span><strong id="ssidValue">UAV-DIRECT-XXXXXX</strong></div>
+   <div class="info-row"><span>Địa chỉ ESP32</span><strong id="ipValue">192.168.4.1</strong></div>
+   <div class="info-row"><span>Thiết bị truy cập</span><strong id="clientValue">—</strong></div>
+   <div class="info-row"><span>Cập nhật trạng thái</span><strong id="lastUpdate">—</strong></div>
+   <div class="button-row"><button class="btn outline" onclick="copyIp()">Sao chép IP</button><button class="btn outline" onclick="wifiStatus()">Làm mới số liệu</button></div>
+   <p class="ota-small">Số liệu tự cập nhật mỗi 8 giây. Tốc độ ước tính từ bộ đếm frames, không phải tốc độ UDP Python nhận thực tế.</p>
+  </div></section>
+  <section class="panel"><div class="panel-head"><div class="head-title"><span class="section-mark">04</span><div><h2>ESP32 Firmware OTA</h2><p>Nạp ứng dụng <code>firmware.bin</code> qua mạng nội bộ.</p></div></div></div><div class="panel-body">
+   <div id="espota_info" class="ota-state">Chưa kiểm tra điều kiện cập nhật firmware.</div>
+   <button id="otaCheckBtn" class="btn outline" onclick="espOtaInfo()">Kiểm tra điều kiện OTA</button>
+   <div style="height:18px"></div>
+   <label class="subhead" for="espbin">Chọn file firmware (.bin)</label>
+   <label class="file-drop"><input id="espbin" type="file" accept=".bin,application/octet-stream" onchange="showFileInfo()"></label>
+   <p id="fileInfo" class="ota-small">Chỉ dùng firmware.bin từ đúng bản ESP32-CAM; không dùng bootloader hoặc partitions.</p>
+   <button id="otaUploadBtn" class="btn primary" onclick="espOtaUpload()" disabled>Cập nhật ESP32</button>
+   <div id="otaProgress" class="progress"></div>
+   <p class="ota-small">OTA chỉ được cho phép khi điều kiện an toàn phía firmware xác nhận. Không ngắt nguồn trong khi đang nạp.</p>
+  </div></section>
+ </aside>
+</div>
+<section class="console"><div class="console-head"><span>NHẬT KÝ GIAO TIẾP</span><span id="logClock">—</span></div><pre id="msg" aria-live="polite">Sẵn sàng. Nhập API token rồi bấm “Kết nối & đọc trạng thái”.</pre></section>
+<footer class="footer"><span>UAV Flight Console v2.0 · ESP32-CAM / STM32G474RE</span><span>Local dashboard · UDP 14550 · 115200 UART</span></footer>
+</div>
 <script>
-const labels=['angle_kp','max_rate_dps','roll_kp','pitch_kp','yaw_kp','roll_ki','pitch_ki','yaw_ki','roll_kd','pitch_kd','yaw_kd','integral_limit','correction_limit'];
-document.getElementById('fields').innerHTML=labels.map((name,i)=>`<label>${name}<input id="f${i}" type="number" step="any"></label>`).join('');
-const t=document.getElementById('token'); t.value=sessionStorage.getItem('uavtoken')||'';
-function show(obj){document.getElementById('msg').textContent=typeof obj==='string'?obj:JSON.stringify(obj,null,2);}
-async function call(path,method='GET',body=null,contentType='application/x-www-form-urlencoded'){sessionStorage.setItem('uavtoken',t.value);const r=await fetch(path,{method,headers:{'X-Auth-Token':t.value,'Content-Type':contentType},body});let d=await r.json();show(d);if(!r.ok&&r.status!==202)throw Error(d.error||`HTTP ${r.status}`);return d;}
-async function wifiStatus(){
- try{
-  const d=await call('/api/status');
-  document.getElementById('netinfo').textContent=`AP: ${d.wifi.ap_ssid} / ${d.wifi.ap_ip} | Thiết bị kết nối: ${d.wifi.ap_clients} | UART bytes: ${d.uart_bytes} | Frames: ${d.frames} | UDP: ${d.udp_sent}`;
- }catch(e){show(e.message)}
-}
-async function init(){await wifiStatus();}
-async function loadPid(){try{let d=await call('/api/pid');d.gains.forEach((v,i)=>document.getElementById('f'+i).value=v);}catch(e){show(e.message)}}
-async function applyPid(){try{let vals=labels.map((_,i)=>document.getElementById('f'+i).value);await call('/api/pid','POST',vals.join(','),'text/plain');}catch(e){show(e.message)}}
-async function savePid(){if(!confirm('Ghi PID vào STM32 Flash? Chỉ khi nguồn ổn định và tháo cánh.'))return;try{await call('/api/save','POST','');}catch(e){show(e.message)}}
-
-async function espOtaInfo(){
- try{let d=await call('/api/esp32/ota/info');
- document.getElementById('espota_info').textContent=`Version: ${d.version} | OTA slot: ${d.ota_bytes_free} bytes | ${d.can_update?'CHO PHEP CAP NHAT':'DANG KHOA · '+d.safety}`;
- }catch(e){show('OTA: '+e.message)}
-}
-// Self-contained SHA-256 fallback for browsers accessing http://192.168.x.x
-// (Web Crypto subtle.digest requires a secure context on many browsers).
+const specs=[
+ {id:0,key:'angle_kp',name:'Angle Kp'},{id:1,key:'max_rate_dps',name:'Max rate (deg/s)'},
+ {id:2,key:'roll_kp',name:'Kp'},{id:3,key:'pitch_kp',name:'Kp'},{id:4,key:'yaw_kp',name:'Kp'},
+ {id:5,key:'roll_ki',name:'Ki'},{id:6,key:'pitch_ki',name:'Ki'},{id:7,key:'yaw_ki',name:'Ki'},
+ {id:8,key:'roll_kd',name:'Kd'},{id:9,key:'pitch_kd',name:'Kd'},{id:10,key:'yaw_kd',name:'Kd'},
+ {id:11,key:'integral_limit',name:'Integral limit'},{id:12,key:'correction_limit',name:'Correction limit'}
+];
+const $=id=>document.getElementById(id);
+const fmt=n=>Number(n).toLocaleString('vi-VN');
+const inputMarkup=(i,label)=>`<label class="form-field"><span>${label}</span><input id="f${i}" type="number" step="any" inputmode="decimal" disabled aria-label="${specs[i].key}"></label>`;
+$('attitudeInputs').innerHTML=inputMarkup(0,'Angle Kp')+inputMarkup(1,'Max rate (°/s)');
+$('rateInputs').innerHTML=[['ROLL',2,5,8],['PITCH',3,6,9],['YAW',4,7,10]].map(r=>`<div class="axis-row"><div class="axis-title">${r[0]}</div>${inputMarkup(r[1],'Kp')}${inputMarkup(r[2],'Ki')}${inputMarkup(r[3],'Kd')}</div>`).join('');
+$('limitInputs').innerHTML=inputMarkup(11,'Integral limit')+inputMarkup(12,'Correction limit');
+let pidLoaded=false,pidWriteAllowed=false,pidDirty=false,otaAllowed=false,otaBusy=false,workBusy=false,prevStatus=null,pollTimer=null;
+const tokenInput=$('token');
+try{tokenInput.value=sessionStorage.getItem('uavtoken')||''}catch(e){}
+function logMessage(message){$('msg').textContent=typeof message==='string'?message:JSON.stringify(message,null,2);$('logClock').textContent=new Date().toLocaleTimeString('vi-VN')}
+function show(message){logMessage(message)}
+function authBadge(kind,message){$('linkPill').className='pill '+kind;$('linkPill').innerHTML='<i class="pulse"></i> '+message;$('authState').className='status-line '+(kind==='good'?'success':kind==='warn'?'error':'');$('authState').textContent=message}
+function applyButtons(){const confirmed=$('benchConfirm').checked;const canWrite=pidLoaded&&pidWriteAllowed&&confirmed&&!workBusy;$('pidApplyBtn').disabled=!canWrite;$('pidSaveBtn').disabled=!canWrite;$('pidReadBtn').disabled=workBusy;$('otaUploadBtn').disabled=!otaAllowed||!confirmed||otaBusy||!$('espbin').files.length;$('otaCheckBtn').disabled=otaBusy}
+$('benchConfirm').addEventListener('change',applyButtons);
+for(let i=0;i<13;i++)$('f'+i).addEventListener('input',()=>{pidDirty=true;$('pidHint').textContent='Có thay đổi chưa áp dụng vào STM32.'});
+function toggleToken(){tokenInput.type=tokenInput.type==='password'?'text':'password'}
+async function call(path,method='GET',body=null,contentType=null){const token=tokenInput.value.trim();if(!token)throw Error('Chưa nhập API token');try{sessionStorage.setItem('uavtoken',token)}catch(e){}const headers={'X-Auth-Token':token};if(contentType)headers['Content-Type']=contentType;const abort=new AbortController();const timeout=setTimeout(()=>abort.abort(),8000);try{const r=await fetch(path,{method,headers,body,signal:abort.signal,cache:'no-store'});let data;const raw=await r.text();try{data=JSON.parse(raw)}catch(e){throw Error('Máy chủ trả dữ liệu không hợp lệ')}if(!r.ok)throw Error(data.error||'HTTP '+r.status);return data} catch(e){if(e.name==='AbortError')throw Error('Thiết bị không phản hồi trong 8 giây');throw e}finally{clearTimeout(timeout)}}
+function setMeter(id,n){$(id).textContent=typeof n==='number'?fmt(n):'—'}
+async function wifiStatus(silent=false){if(otaBusy||workBusy)return;try{const d=await call('/api/status');const wifi=d.wifi||{};setMeter('mUart',d.uart_bytes);setMeter('mFrames',d.frames);setMeter('mUdp',d.udp_sent);setMeter('mCrc',d.crc_bad);$('ssidValue').textContent=wifi.ap_ssid||'—';$('ipValue').textContent=wifi.ap_ip||'192.168.4.1';$('clientValue').textContent=wifi.ap_clients??'—';$('apMode').textContent=wifi.mode||'DIRECT AP';$('lastUpdate').textContent=new Date().toLocaleTimeString('vi-VN');if(prevStatus){const seconds=(Date.now()-prevStatus.at)/1000;if(seconds>0.3){const hz=(Math.max(0,d.frames-prevStatus.frames)/seconds);$('fFrames').textContent='Nhận UART ~ '+hz.toFixed(1)+' frames/s';$('fFrames').className='metric-foot '+(hz>15?'ok':hz<2?'alert':'');const uhz=Math.max(0,d.udp_sent-prevStatus.udp)/seconds;$('fUdp').textContent='Gửi UDP ~ '+uhz.toFixed(1)+' gói/s';$('fUdp').className='metric-foot '+(uhz>10?'ok':'')}}else{$('fFrames').textContent=d.frames>0?'Đã nhận dữ liệu STM32':'Chưa có frame UART'}$('fCrc').textContent=d.crc_bad===0?'Không có lỗi CRC':'Kiểm tra đường UART';$('fCrc').className='metric-foot '+(d.crc_bad===0?'ok':'alert');$('fUart').textContent=d.uart_bytes>0?'ESP32 đang có dữ liệu UART':'Chưa nhận byte UART';prevStatus={at:Date.now(),frames:d.frames,udp:d.udp_sent};authBadge(wifi.ap_active?'good':'warn',wifi.ap_active?'LIÊN KẾT AP HOẠT ĐỘNG':'AP KHÔNG HOẠT ĐỘNG');if(!silent)logMessage('Cập nhật trạng thái thành công. UART frames: '+d.frames+'; UDP: '+d.udp_sent+'.');return d}catch(e){authBadge('warn','KHÔNG ĐỌC ĐƯỢC TRẠNG THÁI');if(!silent)logMessage('Trạng thái: '+e.message);return null}}
+function init(){wifiStatus(false)}
+function checkSafe(){if(!$('benchConfirm').checked)throw Error('Chưa xác nhận tháo cánh và ngắt nguồn động lực')}
+function fillPid(data){if(!Array.isArray(data.gains)||data.gains.length!==13)throw Error('Gói PID thiếu 13 giá trị');data.gains.forEach((v,i)=>{if(!Number.isFinite(Number(v)))throw Error('PID không hợp lệ tại '+specs[i].key);$('f'+i).value=String(v)});pidLoaded=true;pidWriteAllowed=!!data.config_allowed;pidDirty=false;for(let i=0;i<13;i++)$('f'+i).disabled=!pidWriteAllowed;$('pidBadge').className='pill '+(pidWriteAllowed?'good':'warn');$('pidBadge').textContent=pidWriteAllowed?'CONFIG READY':'CHỈ ĐỌC / KHÓA GHI';$('pidHint').textContent=pidWriteAllowed?'Đã đọc PID. Có thể chỉnh giá trị sau khi xác nhận an toàn.':'Đã đọc PID. STM32 chưa cho phép ghi; cần DISARM + KILL + CH8 CONFIG.';applyButtons()}
+async function loadPid(){if(workBusy||otaBusy)return;workBusy=true;applyButtons();try{const d=await call('/api/pid');fillPid(d);logMessage('Đọc PID thành công. STM32: '+(pidWriteAllowed?'cho phép cấu hình':'chưa cho phép ghi')+'.')}catch(e){logMessage('Đọc PID lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
+function collectGains(){const values=specs.map(s=>Number($('f'+s.id).value));if(values.some((v,i)=>!Number.isFinite(v)||$('f'+i).value.trim()===''))throw Error('Phải nhập đầy đủ 13 giá trị số hữu hạn');return values}
+async function applyPid(){if(workBusy||otaBusy)return;try{checkSafe();if(!pidLoaded||!pidWriteAllowed)throw Error('Cần Đọc PID và STM32 phải cho phép cấu hình');const values=collectGains();if(!confirm('Áp dụng 13 giá trị PID vào RAM STM32?\nThay đổi có thể ảnh hưởng điều khiển; UAV đã tháo cánh và ngắt nguồn động lực?'))return;workBusy=true;applyButtons();const d=await call('/api/pid','POST',values.join(','),'text/plain');fillPid(d);logMessage('Áp dụng PID vào RAM thành công. Chưa ghi Flash.')}catch(e){logMessage('Áp dụng RAM lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
+async function savePid(){if(workBusy||otaBusy)return;try{checkSafe();if(!pidLoaded||!pidWriteAllowed)throw Error('STM32 chưa cho phép cấu hình');if(pidDirty)throw Error('Có giá trị thay đổi chưa áp dụng RAM. Hãy bấm Áp dụng RAM trước.');if(!confirm('GHI PID XUỐNG FLASH STM32?\nChỉ làm khi nguồn ổn định, đã tháo cánh, ngắt nguồn động lực, ARM OFF/KILL ON/CH8 CONFIG ON.'))return;workBusy=true;applyButtons();const d=await call('/api/save','POST');if(d.status!==0)throw Error('STM32 từ chối lưu PID');logMessage('STM32 xác nhận đã lưu PID vào Flash.')}catch(e){logMessage('Save Flash lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
+async function espOtaInfo(){if(otaBusy)return;try{const d=await call('/api/esp32/ota/info');otaAllowed=!!d.can_update;$('espota_info').textContent='Firmware '+d.version+' · Slot '+fmt(d.ota_bytes_free)+' bytes · '+(otaAllowed?'ĐỦ ĐIỀU KIỆN OTA':'CHƯA ĐỦ ĐIỀU KIỆN: '+d.safety);$('espota_info').className='ota-state '+(otaAllowed?'good':'bad');applyButtons();return d}catch(e){otaAllowed=false;$('espota_info').textContent='Lỗi kiểm tra OTA: '+e.message;$('espota_info').className='ota-state bad';applyButtons();return null}}
+function showFileInfo(){const f=$('espbin').files[0];$('fileInfo').textContent=f?('Đã chọn: '+f.name+' · '+fmt(f.size)+' bytes'):'Chưa chọn file firmware.';applyButtons()}
 function sha256Local(input){
  const k=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
  const h=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
@@ -716,23 +767,12 @@ function sha256Local(input){
  }
  return h.map(x=>x.toString(16).padStart(8,'0')).join('');
 }
-async function espOtaUpload(){
- const f=document.getElementById('espbin').files[0];if(!f){show('Chọn firmware.bin trước');return;}
- if(!f.name.endsWith('.bin')){show('Phải dùng file firmware.bin');return;}
- if(!confirm('ESP32 sẽ tự cập nhật và reboot. Đã THÁO CÁNH, NGẮT NGUỒN ESC, ARM OFF + KILL ON + CONFIG ON?'))return;
- try{
-  const st=await call('/api/esp32/ota/info');if(!st.can_update)throw Error('OTA bị khóa: '+st.safety);
-  if(f.size>st.ota_bytes_free)throw Error('Firmware lớn hơn OTA slot ('+st.ota_bytes_free+' bytes)');
-  show('Đang đọc và tính SHA256 cho '+f.name+' ...');let b=await f.arrayBuffer();
-  let sha=((window.crypto && crypto.subtle)?Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',b))).map(x=>x.toString(16).padStart(2,'0')).join(''):sha256Local(b));
-  const fd=new FormData();fd.append('firmware',f,f.name);
-  show('SHA256: '+sha+'\nĐang upload... không ngắt nguồn');
-  const r=await fetch('/api/esp32/ota',{method:'POST',headers:{'X-Auth-Token':t.value,'X-SHA256':sha,'X-Firmware-Size':String(f.size)},body:fd});
-  const body=await r.json();show(body);if(!r.ok)throw Error(body.error||'HTTP '+r.status);
-  show('Đã xác minh firmware. ESP32 sẽ reboot nếu trạng thái an toàn vẫn hợp lệ. Đợi ESP32 vào Wi-Fi lại.');
- }catch(e){show('ESP32 OTA lỗi: '+e.message)}
-}
-</script></html>
+async function espOtaUpload(){if(otaBusy)return;const f=$('espbin').files[0];if(!f){logMessage('Chưa chọn firmware.bin');return}try{checkSafe();if(!f.name.toLowerCase().endsWith('.bin'))throw Error('Chỉ nhận firmware .bin');if(!confirm('CẬP NHẬT ESP32 VÀ KHỞI ĐỘNG LẠI?\nUAV đã tháo cánh, ngắt nguồn ESC và đang ở CONFIG an toàn?'))return;otaBusy=true;applyButtons();const d=await call('/api/esp32/ota/info');if(!d.can_update)throw Error('OTA bị khóa: '+d.safety);if(f.size>d.ota_bytes_free)throw Error('Firmware lớn hơn vùng OTA');logMessage('Đang kiểm tra SHA-256 cho '+f.name);$('otaProgress').classList.add('active');const b=await f.arrayBuffer();const sha=(window.crypto&&crypto.subtle)?Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',b))).map(x=>x.toString(16).padStart(2,'0')).join(''):sha256Local(b);const fd=new FormData();fd.append('firmware',f,f.name);logMessage('Đang upload firmware; tuyệt đối không ngắt nguồn.');const r=await fetch('/api/esp32/ota',{method:'POST',headers:{'X-Auth-Token':tokenInput.value.trim(),'X-SHA256':sha,'X-Firmware-Size':String(f.size)},body:fd});let res=await r.json();if(!r.ok)throw Error(res.error||'HTTP '+r.status);logMessage('Đã xác minh firmware. ESP32 sẽ reboot nếu điều kiện an toàn vẫn hợp lệ.')}catch(e){logMessage('OTA lỗi: '+e.message)}finally{otaBusy=false;$('otaProgress').classList.remove('active');applyButtons()}}
+function copyIp(){const ip=$('ipValue').textContent;if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(ip).then(()=>logMessage('Đã sao chép IP: '+ip)).catch(()=>window.prompt('Sao chép IP:',ip))}else window.prompt('Sao chép IP:',ip)}
+applyButtons();pollTimer=setInterval(()=>{if(tokenInput.value.trim()&&!otaBusy&&!workBusy)wifiStatus(true)},8000);
+</script>
+</body></html>
+
 )HTML";
 } // namespace
 
