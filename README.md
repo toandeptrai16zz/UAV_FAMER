@@ -1,7 +1,7 @@
 # UAV DATN — STM32G474RE + ESP32-CAM (Direct Wi-Fi)
 
-> **Cập nhật: 04/11/2026 — cấu hình đang sử dụng trên UAV.**  
-> Flight controller **NUCLEO-G474RE**, truyền telemetry và PID hai chiều đến **ESP32-CAM AI-Thinker** qua LPUART1 **PC1/PC0 (Arduino A4/A5)**. ESP32-CAM **phát Wi-Fi trực tiếp** `UAV-DIRECT-XXXXXX` tại `192.168.4.1`, không kết nối router. Ground Station nhận UDP tại cổng `14550`.
+> **Cập nhật: 05/11/2026 — cấu hình đang sử dụng trên UAV; Ground Station realtime đã thử nhận UDP và vẽ biểu đồ thành công.**  
+> Flight controller **NUCLEO-G474RE**, truyền telemetry và PID hai chiều đến **ESP32-CAM AI-Thinker** qua LPUART1 **PC1/PC0 (Arduino A4/A5)**. ESP32-CAM **phát Wi-Fi trực tiếp** `UAV-DIRECT-XXXXXX` tại `192.168.4.1`, không kết nối router. Ground Station nhận UDP tại cổng `14550`; dashboard realtime chạy **trên laptop** tại `http://127.0.0.1:8765`, không phải trên ESP32.
 >
 > **Trạng thái: firmware thử nghiệm (flight candidate), không phải hệ thống đã được xác nhận an toàn bay.** Tháo cánh và ngắt nguồn động lực khi nạp, chỉnh PID, OTA hoặc kiểm tra kết nối. Không bật Wi-Fi 2.4 GHz cùng bộ thu RC 2.4 GHz khi bay nếu chưa kiểm tra nhiễu, tầm điều khiển và failsafe.
 
@@ -13,7 +13,8 @@ README này mô tả **cấu hình mới nhất đã thống nhất**, dựa tr�
 | --- | --- |
 | Wi-Fi trực tiếp ESP32-CAM | **Đã kiểm tra thực tế**: laptop kết nối AP, truy cập `192.168.4.1` và ping thành công |
 | Telemetry STM32 → ESP32 | **Đã kiểm tra thực tế** sau khi chuyển LPUART1 sang A4/A5: `frames` tăng liên tục, `crc_bad=0` trong log đã cung cấp |
-| ESP32 → Ground Station UDP | **Đã nhận gói thực tế** trên Python, nhưng tốc độ không ổn định; có `seq_gaps` |
+| ESP32 → Ground Station UDP | **Đã nhận thực tế**; ảnh mới ghi 4.162 gói hợp lệ, 40,8 Hz (cửa sổ 5 giây), 0 gói CRC/format lỗi. Có 1.752 `seq_gaps` tích lũy; chưa chứng minh ổn định khi bay. |
+| Biểu đồ Ground Station realtime | **Đã chạy trên laptop**: Roll/Pitch, gyro, accel, RC, PID correction, DShot M1–M4, MT-06; ghi CSV tự động |
 | Đọc 13 thông số PID qua web | **Đã hiển thị thành công** trong ảnh thử nghiệm gần nhất |
 | Áp dụng PID (RAM), lưu Flash | Có code và API; **chưa coi là đã kiểm chứng an toàn vận hành** |
 | ESP32 OTA qua Wi-Fi | Có code, kiểm tra SHA-256 và điều kiện an toàn; chỉ dùng sau khi kiểm tra trên bàn |
@@ -33,7 +34,8 @@ flowchart LR
     RANGE[MT-06] -->|USART3 / MAVLink| STM
     STM -->|TIM3 DMA-burst / DShot300| ESC[ESC 1 - 4]
     STM <-->|LPUART1 115200 8N1\nPC1/A4 TX - PC0/A5 RX| ESP[ESP32-CAM]
-    ESP <-->|Wi-Fi AP 192.168.4.1\nHTTP + UDP 14550| GS[Laptop / điện thoại\nWeb Dashboard + Python]
+    ESP <-->|Wi-Fi AP 192.168.4.1\nHTTP + UDP 14550| GS[Laptop / điện thoại\nESP32 web + Python UDP]
+    GS --> CHART[Realtime charts trên laptop\nlocalhost:8765 + CSV]
 ```
 
 ESP32-CAM là **cầu nối truyền thông**. Nó không trực tiếp điều khiển động cơ, không thay thế các kiểm tra ARM/KILL/failsafe trong STM32. Camera và thẻ microSD **không được sử dụng** trong bản cầu nối này; GPIO13/14 dành cho UART.
@@ -104,13 +106,15 @@ UAV_DATN/
 │   │   ├── uav_ota4m.csv
 │   │   └── src/main.cpp                  # Direct AP + Web Dashboard + UDP + OTA
 │   └── GroundStation/
-│       ├── uav_ground_station.py         # UDP HELLO + CSV + biểu đồ tùy chọn
+│       ├── uav_ground_station.py         # Decoder UDP gốc + CSV + biểu đồ matplotlib tùy chọn
+│       ├── realtime_dashboard.py          # Dashboard HTML realtime + CSV (cần chép vào project)
+│       ├── README_REALTIME_VI.md          # Hướng dẫn dashboard (tùy chọn)
 │       ├── uav_control.py                # PID/HTTP CLI
 │       └── uav_esp32_ota.py              # OTA ESP32 CLI
 └── Document/                              # Tài liệu kiểm tra an toàn và lịch sử
 ```
 
-**Chú ý:** ZIP Dashboard V2 cũng có bản sao `GroundStation/` bên trong `ESP32_CAM/`. Trên máy đang dùng, vị trí chạy thực tế là `Telemetry/GroundStation/`; không cần chạy hai Ground Station đồng thời. Chỉ giữ **một** `src/main.cpp` cho PlatformIO.
+**Chú ý:** `realtime_dashboard.py` được phát triển riêng cho laptop và **chưa có sẵn trong ZIP `UAV_DATN5` gốc**; chép nó và `uav_ground_station.py` vào cùng thư mục `Telemetry/GroundStation/` trước khi commit. Giữ source Python mới trong Git nhưng bỏ qua `logs/` và các file CSV sinh ra bằng `.gitignore`. ZIP Dashboard V2 cũng có bản sao `GroundStation/` bên trong `ESP32_CAM/`. Trên máy đang dùng, vị trí chạy thực tế là `Telemetry/GroundStation/`; không cần chạy hai Ground Station đồng thời. Chỉ giữ **một** `src/main.cpp` cho PlatformIO.
 
 ## 5. Build/nạp STM32G474RE
 
@@ -205,6 +209,69 @@ Ground Station gửi `UAVT_HELLO` định kỳ qua UDP 14550 để ESP32 ghi nh�
 
 Dòng `packets=...` tăng là có telemetry. `invalid` là gói không hợp lệ theo parser Python; `seq_gaps` cho thấy bỏ lỡ số thứ tự (có thể do STM32 bỏ khung khi UART bận hoặc UDP mất gói). `rate` được chương trình tính từ số gói trên thời gian tích lũy; **không phải tần số tức thời**.
 
+### 7.3. Ground Station realtime: biểu đồ + CSV tự động (đã chạy được)
+
+Dashboard realtime là **chương trình Python riêng trên laptop**, không phải giao diện PID của ESP32 tại `192.168.4.1`. Nó dùng bộ giải mã `decode_frame` từ `uav_ground_station.py`, không cần thêm thư viện pip hoặc kết nối Internet. Không thay firmware STM32, ESP32 hoặc thuật toán điều khiển bay.
+
+Để đưa chương trình vào repository (thực hiện một lần nếu hiện đang dùng gói riêng trong `~/Downloads`):
+
+```bash
+cd ~/Desktop/UAV_DATN
+cp ~/Downloads/UAV_GroundStation_Realtime_Charts/realtime_dashboard.py \
+   Telemetry/GroundStation/realtime_dashboard.py
+# Bảo đảm uav_ground_station.py gốc ở cùng thư mục (file decode_frame).
+```
+
+**Chỉ chạy một chương trình chiếm cổng UDP 14550**: đóng `uav_ground_station.py` hoặc dashboard cũ bằng Ctrl+C, vì hai chương trình có thể cùng bind UDP và chia dữ liệu nhận. Kiểm tra trước:
+
+```bash
+ss -lunp | grep ':14550' || true
+```
+
+Giữ laptop ở Wi-Fi `UAV-DIRECT-XXXXXX`, rồi chạy:
+
+```bash
+cd ~/Desktop/UAV_DATN/Telemetry/GroundStation
+python3 realtime_dashboard.py --ip 192.168.4.1
+```
+
+Mở trình duyệt **trên cùng laptop**: **http://127.0.0.1:8765**. Không mở `192.168.4.1:8765` vì Web dashboard realtime phục vụ cục bộ. Đóng bằng Ctrl+C. Tùy chọn `--port` thay UDP 14550, `--http-port` thay cổng Web 8765, `--csv` đặt đường dẫn ghi file. Mặc định server HTTP chỉ bind `127.0.0.1` để không mở giao diện ra Wi-Fi.
+
+| Biểu đồ / nhóm | Nguồn dữ liệu thực tế |
+| --- | --- |
+| 01 — Roll / Pitch | MPU6500, độ |
+| 02 — Gyroscope XYZ | MPU6500, độ/giây |
+| 03 — Accelerometer XYZ | MPU6500, raw counts (chưa quy đổi sang g) |
+| 04 — RC / SBUS | Ga, Roll, Pitch, Yaw dạng raw |
+| 05 — PID correction | Đầu ra correction Roll/Pitch/Yaw; **không phải Kp/Ki/Kd** |
+| 06 — DShot output M1–M4 | Giá trị lệnh xuất theo 4 motor |
+| 07 — MT-06 range | Khoảng cách khi cảm biến báo hợp lệ |
+| Chất lượng liên kết | Tần số gói nhận trong 5 giây, tuổi gói cuối, gói CRC/format sai, sequence gap |
+
+Biểu đồ có cửa sổ thời gian **15/30/60/120 giây**. Giao diện truy vấn số liệu khoảng **10 lần/giây**, còn **mọi gói hợp lệ** được ghi CSV vào `Telemetry/GroundStation/logs/uav_YYYYmmdd_HHMMSS.csv` (thư mục này phải được `.gitignore` bỏ qua). HTTP `http://127.0.0.1:8765/api/snapshot` cung cấp snapshot JSON cho việc kiểm tra. Nếu không có gói mới quá 1,5 giây, trang hiển thị trạng thái mất telemetry; đây **không phải lệnh failsafe**.
+
+#### Kết quả kiểm tra thực tế ngày 05/11/2026
+
+Ảnh Ground Station người thử nghiệm cung cấp cho thấy:
+
+| Chỉ số | Giá trị tại thời điểm chụp |
+| --- | ---: |
+| Gói hợp lệ từ khi chạy chương trình | **4.162** |
+| Tốc độ nhận trong 5 giây gần nhất | **40,8 Hz** |
+| Tuổi dữ liệu mới nhất | **0,04 giây** |
+| Gói UDP CRC/format sai | **0** |
+| Nhảy sequence tích lũy | **1.752** |
+
+Các biểu đồ Roll/Pitch, gyro, accel và RC đã có đường dữ liệu thực tế; các nhóm PID, DShot, MT-06 cũng được hiển thị. Đây là **một lần kiểm tra qua Wi-Fi trên bàn**, không phải phép đo bảo đảm thông suốt khi drone bay hoặc ở khoảng cách xa. `seq_gaps` **không được quy toàn bộ cho Wi-Fi** vì STM32 có thể bỏ lượt gửi khi UART bận. Để đánh giá bay thử cần thử tầm liên kết và failsafe riêng, đo khoảng gián đoạn dữ liệu dài nhất, so sánh sequence UART/UDP và kiểm tra nhiễu RC 2,4 GHz.
+
+**Cảnh báo từ ảnh thử:** Ground Station từng hiển thị `ARMED`, `KILL: OFF`, `Link: OK`, `IMU: FRESH`, trong khi DShot output tại thời điểm ảnh là 0. **Đây không phải trạng thái an toàn để thao tác trên bàn khi motor có nguồn động lực**; giữ DISARM, KILL ON, tháo cánh và cách ly nguồn động lực trước khi kiểm tra giao diện hoặc thay PID.
+
+**Chưa có trong frame telemetry v1 (88 byte):** giá trị áp suất, nhiệt độ và độ cao **DPS310**; điện áp và dòng pin thực (các trường hiện là sentinel/chưa đo). Muốn vẽ các dữ liệu này phải bổ sung phần đóng gói ở STM32, giải mã ESP32/Python tương ứng và xác minh bằng cảm biến thực; không được hiển thị số giả.
+
+### 7.4. Lỗi thường gặp khi dashboard báo `CHỜ TELEMETRY`
+
+Nếu web ở `localhost:8765` mở được nhưng báo `0 gói`, kiểm tra laptop đang ở Wi-Fi của ESP32, thử `ping -c 4 192.168.4.1`, rồi xem `ss -lunp | grep ':14550'`. Trong buổi kiểm tra đã từng có **hai** process Python cùng mở UDP 14550 làm một dashboard không nhận gói. Dừng chúng đúng cách bằng Ctrl+C và chỉ chạy **một** `realtime_dashboard.py`. Nếu chưa có telemetry, `/api/status` của ESP32 giúp phân biệt UART chưa nhận, UART có frame nhưng chưa gửi UDP, hay UDP không tới laptop.
+
 ## 8. Web Dashboard và PID
 
 Kết nối laptop/điện thoại vào AP rồi mở `http://192.168.4.1/`. Dashboard V2 có các nhóm **trạng thái kết nối, UART/frames/UDP, quản trị token, cấu hình PID, OTA ESP32**. Trang chủ vẫn tải được trước khi nhập token; API điều khiển/đọc chi tiết yêu cầu header `X-Auth-Token`.
@@ -280,7 +347,9 @@ Source vẫn có endpoint thử nghiệm `POST /api/ota` và mã giao tiếp ROM
 | `uart_bytes` tăng, `frames=0` | Baud 115200 8N1, phiên bản protocol, CRC, nhiễu UART |
 | Telemetry có, nút **Đọc PID** báo `STM32 no reply` | Kiểm tra chiều **GPIO14 → A5/PC0**, ngắt RX STM32, callback và parser lệnh |
 | `frames` tăng, `udp_sent=0` | Chưa mở Ground Station hoặc chưa gửi `UAVT_HELLO`; kiểm tra IP/cổng |
-| Python có `packets` nhưng `seq_gaps` tăng | Phân biệt mất khung tại STM32/UART với mất gói qua Wi-Fi; UART đang chia sẻ log ASCII |
+| Python có `packets` nhưng `seq_gaps` tăng | Phân biệt STM32 bỏ lượt TX, khung UART và mất gói Wi-Fi; không quy hết cho nhiễu sóng |
+| Dashboard realtime mở được nhưng `0 gói` | Đảm bảo chỉ **một** process Python bind UDP 14550, laptop đang ở Wi-Fi ESP32, UDP HELLO gửi được |
+| Dashboard hiện `ARMED` khi thử trên bàn | Đưa RC về ARM OFF / KILL ON, tháo cánh và cách ly nguồn động lực trước khi thử tiếp |
 | Apply/Save PID bị khóa | ARM OFF, KILL ON, ga thấp, CH8 CONFIG, telemetry mới và xác nhận kiểm thử trên bàn |
 | OTA ESP32 bị từ chối | Kiểm tra `/api/esp32/ota/info`; không vượt qua khóa an toàn |
 
@@ -297,4 +366,4 @@ Tài liệu nội bộ tham khảo: [`Document/FLIGHT_CANDIDATE_VI.md`](Document
 
 ---
 
-**Phạm vi cập nhật tài liệu:** README này chỉ mô tả trạng thái mã nguồn và những phép thử đã báo cáo; nó **không tự thay đổi** `.ioc`, HAL, ESP32 hoặc firmware đang chạy trên drone. Khi đồng bộ một project mới từ `UAV_DATN5.zip`, cần áp dụng patch UART A4/A5 và source Direct-AP Dashboard V2 riêng trước khi build.
+**Phạm vi cập nhật tài liệu:** README này mô tả cả dashboard realtime đã chạy trên laptop và những phép thử đã báo cáo; nó **không tự thay đổi** `.ioc`, HAL, ESP32 hoặc firmware đang chạy trên drone. Khi đồng bộ một project mới từ `UAV_DATN5.zip`, cần áp dụng patch UART A4/A5 và source Direct-AP Dashboard V2 riêng trước khi build.
