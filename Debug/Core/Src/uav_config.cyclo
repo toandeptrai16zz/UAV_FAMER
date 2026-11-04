@@ -1,0 +1,17 @@
+../Core/Src/uav_config.c:47:17:crc16	4
+../Core/Src/uav_config.c:57:17:hash32	2
+../Core/Src/uav_config.c:63:13:flash_dual_bank	4
+../Core/Src/uav_config.c:73:13:record_valid	4
+../Core/Src/uav_config.c:79:13:load_gains	6
+../Core/Src/uav_config.c:91:13:persist_gains	13
+../Core/Src/uav_config.c:131:13:rx_arm	4
+../Core/Src/uav_config.c:137:6:UAVConfig_Init	1
+../Core/Src/uav_config.c:147:6:UAVConfig_OnRxComplete	3
+../Core/Src/uav_config.c:155:6:UAVConfig_OnTxComplete	4
+../Core/Src/uav_config.c:162:6:UAVConfig_OnError	2
+../Core/Src/uav_config.c:166:13:make_reply	5
+../Core/Src/uav_config.c:188:13:handle_request	16
+../Core/Src/uav_config.c:231:13:parse_byte	13
+../Core/Src/uav_config.c:252:6:UAVConfig_Service	9
+../Core/Src/uav_config.c:270:13:jump_rom_loader	1
+../Core/Src/uav_config.c:290:6:UAVConfig_ServiceBoot	7

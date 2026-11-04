@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """UAV telemetry ground station: UDP receiver, CRC checker, CSV logger, optional live plot.
 
-Network defaults: join Wi-Fi AP UAV-TELEM, ESP32 AP 192.168.4.1, UDP port 14550.
+Network: use setup AP 192.168.4.1 OR ESP32 STA IP on your 2.4 GHz router. UDP 14550.
 Protocol: 88-byte little-endian v1 frame; see Telemetry/README_VI.md.
 """
 from __future__ import annotations
@@ -144,7 +144,7 @@ class LivePlot:
 
 def run() -> int:
     parser = argparse.ArgumentParser(description="Receive UAV UDP telemetry and record CSV")
-    parser.add_argument("--ip", default="192.168.4.1", help="ESP32-CAM SoftAP address")
+    parser.add_argument("--ip", default="192.168.4.1", help="ESP32-CAM direct AP IP: 192.168.4.1")
     parser.add_argument("--port", type=int, default=UDP_PORT, help="UDP local/remote port")
     parser.add_argument("--csv", default="uav_telemetry.csv", help="CSV output path")
     parser.add_argument("--plot", action="store_true", help="show optional live matplotlib plots")
@@ -178,7 +178,7 @@ def run() -> int:
 
     print(f"Listening UDP 0.0.0.0:{args.port}; HELLO -> {args.ip}:{args.port}")
     print(f"CSV: {output_path.resolve()}")
-    print("Join Wi-Fi UAV-TELEM first. Ctrl+C to stop.")
+    print("Join UAV-DIRECT-XXXXXX directly; Ctrl+C to stop.")
 
     try:
         with output_path.open("w", newline="", encoding="utf-8") as csv_file:

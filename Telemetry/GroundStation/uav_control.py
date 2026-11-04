@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """STM32 PID configuration and bench-only ROM firmware update via ESP32-CAM.
 
-Only use with all propellers removed. HTTP runs on the isolated Wi-Fi SoftAP.
-Auth token: read from ESP32_CAM/secrets.h and supply through UAV_API_TOKEN env.
+Only use with all propellers removed. HTTP reachable on ESP32 setup AP or trusted 2.4 GHz router LAN.
+Auth token: read from first-boot ESP32 Serial Monitor and supply via UAV_API_TOKEN env.
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def main() -> int:
                     help="You must confirm the propellers are removed")
     args = ap.parse_args()
     if len(args.token) < 24:
-        ap.error("set UAV_API_TOKEN to the 24+ character value from ESP32 secrets.h")
+        ap.error("set UAV_API_TOKEN to the 24+ character value from ESP32 serial log")
     if args.cmd == "status":
         result = request(args.host, "GET", "/api/status", args.token)
     elif args.cmd == "get":

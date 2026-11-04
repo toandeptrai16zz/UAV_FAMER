@@ -491,10 +491,7 @@ static bool dshot_send_all(const uint16_t command[PWM_OUTPUT_COUNT]) {
 /* ----------------------------- Motor control -------------------------- */
 static uint32_t boot_ms;
 static bool armed, arm_ready, spinning, link_prev, throttle_filter_initialized, low_tracking, alt_hold_active;
-<<<<<<< HEAD
 static bool uav_config_allowed;
-=======
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
 static bool arm_switch_prev;
 static uint32_t link_up_ms, low_since_ms;
 static uint16_t win_min, win_max, throttle_zero;
@@ -704,10 +701,7 @@ static void motor_step(void)
     } else if (!arm_switch_on) {
         armed = false; arm_ready = true;
     } else if (!armed && arm_rising && arm_ready && link_stable && stick_stable_low &&
-<<<<<<< HEAD
                (channels[CH_CONFIG] < CONFIG_SWITCH_THRESHOLD) &&
-=======
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
                level_for_arm && neutral_for_arm &&
                !mc7re_guard.latched && !mc7re_guard.candidate &&
                dshot_tx_recovered) {
@@ -1126,11 +1120,7 @@ void uav_test_init(void)
 
     mc7re_guard_init(&mc7re_guard);
     debug_rf_guard_reason = 5u; debug_rf_preset = false; debug_rf_latched = true;
-<<<<<<< HEAD
     armed = false; arm_ready = false; arm_switch_prev = false; spinning = false; uav_config_allowed = false; link_prev = false; throttle_filter_initialized = false; low_tracking = false;
-=======
-    armed = false; arm_ready = false; arm_switch_prev = false; spinning = false; link_prev = false; throttle_filter_initialized = false; low_tracking = false;
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
     imu_control_valid = false;
     imu_gap_count = 0u; imu_dt_max_ms = 0u; motor_dt_max_ms = 0u; motor_late_count = 0u;
     throttle_ratio = 0.0f; imu_read_errors = 0u; imu_last_good_ms = 0u; imu_sample_sequence = 0u; pid_last_sample_sequence = 0u;
@@ -1245,13 +1235,10 @@ void uav_test_loop(void)
         last_motor_update_ms = now;
         motor_step();
     }
-<<<<<<< HEAD
     /* This command service never runs in an IRQ and never waits for Wi-Fi.
      * RC data is still read by the normal SBUS failsafe path. */
     UAVConfig_Service(uav_config_allowed);
     UAVConfig_ServiceBoot(uav_config_allowed);
-=======
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
 
     if (barometer_ready) (void)DPS310_Update(&barometer);
     now = HAL_GetTick();
@@ -1289,11 +1276,7 @@ void uav_test_loop(void)
          * Flags 0x04/0x08 and timeout remain independently visible. */
         const uint8_t fs_guard = debug_rf_latched ? debug_rf_guard_reason : fs_reason;
         last_log_ms = now;
-<<<<<<< HEAD
         log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu TLM=%lu TLD=%lu\r\n",
-=======
-        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu\r\n",
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
                   (unsigned long)(++log_sequence),
                   rx_fresh ? 1u : 0u, debug_link_ok ? 1u : 0u,
                   (unsigned)fs_guard, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
@@ -1332,13 +1315,9 @@ void uav_test_loop(void)
                   (long)debug_mixer_offset,
                   (unsigned long)imu_dt_max_ms, (unsigned long)motor_dt_max_ms,
                   (unsigned long)motor_late_count, (unsigned long)imu_gap_count,
-<<<<<<< HEAD
                   (unsigned long)imu_read_errors,
                   (unsigned long)UAVTelemetry_GetCompleted(),
                   (unsigned long)UAVTelemetry_GetDropped());
-=======
-                  (unsigned long)imu_read_errors);
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
     }
 
     /* Binary telemetry follows the 1 Hz ASCII status write on the same UART.
