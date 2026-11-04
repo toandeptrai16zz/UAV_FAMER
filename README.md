@@ -3,7 +3,11 @@
 # UAV DATN — STM32G474RE
 
 Rà soát 03/11/2026: đọc [STABILITY_REVIEW_VI.md](STABILITY_REVIEW_VI.md)
+<<<<<<< HEAD
 trước khi build/nạp. Gói nâng cấp giữ source và tài liệu; đã lược bỏ thư mục `.git` và các binary cũ trong `Debug/Release` để tránh nạp nhầm.
+=======
+trước khi build/nạp. Gói giữ toàn bộ tệp gốc; các binary build cũ không phải bản sửa mới.
+>>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
 
 Firmware thử nghiệm cho board NUCLEO-G474RE. Nhận SBUS, điều khiển bốn ESC
 bằng DShot300, đọc IMU MPU6500 và hỗ trợ cảm biến DPS310, MT-06.
@@ -95,7 +99,10 @@ Firmware đầu ra: `build/Debug/UAV_.elf`.
 
 - [PINOUT.png](PINOUT.png): sơ đồ chân NUCLEO-G474RE.
 - [FLIGHT_CANDIDATE_VI.md](FLIGHT_CANDIDATE_VI.md): cấu hình, pre-arm và checklist trước cánh.
+<<<<<<< HEAD
 
 ## UAV Telemetry (STM32G474RE + ESP32-CAM AI-Thinker)
 
 Tài liệu sơ đồ UART/nguồn, packet protocol, firmware ESP32-CAM và Ground Station nằm tại [`Telemetry/README_VI.md`](Telemetry/README_VI.md).
+=======
+>>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e

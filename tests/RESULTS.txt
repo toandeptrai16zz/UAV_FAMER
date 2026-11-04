@@ -1,5 +1,8 @@
+<<<<<<< HEAD
 PASS runtime PID defaults/bounds/NAN/atomic APPLY
 PASS CH8 CONFIG gate + existing ARM behavior (no midflight CH8 motor cutoff)
+=======
+>>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
 PASS all DShot payloads/CRC, SBUS 16-channel decode, RC neutral/low throttle
 PASS ARM edge, failed attempt, normal spin, KILL, no automatic rearm
 PASS SBUS failsafe/timeout/preset, DMA fault, invalid PID, PID time gap
@@ -9,8 +12,11 @@ PASS complementary decay equivalence at 1/2 ms for static gyro input
 PASS mixer directions, 34,606 saturation cases, invalid input
 
 Host GCC + UBSan; mocked HAL. Not an ARM firmware build or flight test.
+<<<<<<< HEAD
 PASS UART control CRC framing, telemetry protocol compatibility, bit11 flag
 Python CLI/telemetry py_compile passed.
 
 STM32 ARM GCC / ESP32 PlatformIO builds: NOT RUN (toolchains unavailable here).
 STM32 physical UART, PID flash save, ROM OTA and flight: NOT VERIFIED.
+=======
+>>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e

@@ -11,6 +11,7 @@ TIM_HandleTypeDef htim3={&timer};
 SPI_HandleTypeDef hspi2;
 DMA_HandleTypeDef hdma_tim3_up;
 I2C_HandleTypeDef hi2c1;
+<<<<<<< HEAD
 /* UART bridge mocks: independent protocol module is tested separately. */
 void UAVTelemetry_Reset(void) {}
 bool UAVTelemetry_Send(UART_HandleTypeDef *u, const UAVTelemetrySample *s) {(void)u;(void)s;return true;}
@@ -24,6 +25,8 @@ void UAVConfig_OnTxComplete(UART_HandleTypeDef *u) {(void)u;}
 void UAVConfig_OnError(UART_HandleTypeDef *u) {(void)u;}
 void UAVConfig_Service(bool safe) {(void)safe;}
 void UAVConfig_ServiceBoot(bool safe) {(void)safe;}
+=======
+>>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
 uint32_t HAL_GetTick(void){return tick;}
 void HAL_Delay(uint32_t x){tick+=x;}
 void HAL_GPIO_WritePin(int p,int n,int v){(void)p;(void)n;(void)v;}
@@ -133,6 +136,7 @@ static void test_protocol(void){
  assert(sbus_flags==8);
  puts("PASS all DShot payloads/CRC, SBUS 16-channel decode, RC neutral/low throttle");
 }
+<<<<<<< HEAD
 static void test_config_mode(void){
  setup();sbus_channels[CH_CONFIG]=1800;sbus_channels[CH_KILL]=1800;step();
  assert(uav_config_allowed && !armed && !spinning);
@@ -157,3 +161,6 @@ static void test_runtime_gains(void){
 }
 int main(void){
  test_runtime_gains(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_mixer();return 0;}
+=======
+int main(void){test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_mixer();return 0;}
+>>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
