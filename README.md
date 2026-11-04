@@ -1,16 +1,22 @@
+> **BẢN NÂNG CẤP 04/11/2026:** đọc [HUONG_DAN_NANG_CAP_WIFI_PID_OTA_VI.md](HUONG_DAN_NANG_CAP_WIFI_PID_OTA_VI.md) trước khi nạp. UDP telemetry giữ nguyên; đã bổ sung PID qua HTTP, UART hai chiều và thử nghiệm ROM OTA (khóa mặc định). Bản này CHƯA ĐƯỢC KIỂM NGHIỆM TRÊN PHẦN CỨNG.
+
 # UAV DATN — STM32G474RE
+
+Rà soát 03/11/2026: đọc [STABILITY_REVIEW_VI.md](STABILITY_REVIEW_VI.md)
+trước khi build/nạp. Gói nâng cấp giữ source và tài liệu; đã lược bỏ thư mục `.git` và các binary cũ trong `Debug/Release` để tránh nạp nhầm.
 
 Firmware thử nghiệm cho board NUCLEO-G474RE. Nhận SBUS, điều khiển bốn ESC
 bằng DShot300, đọc IMU MPU6500 và hỗ trợ cảm biến DPS310, MT-06.
 
-> **Cảnh báo:** PID roll/pitch đang bật nhưng chưa được hiệu chuẩn trên UAV
-> thực tế. Chưa có PID yaw hoặc giữ độ cao. Đây không phải firmware sẵn sàng
-> bay; tháo toàn bộ cánh quạt khi kiểm tra.
+> **FLIGHT CANDIDATE:** ARM bay đã được mở, bộ quét ESC tuần tự đã tắt. Đây là
+> bản chuyển từ bench sang kiểm tra điều khiển bay có kiểm soát, không phải firmware
+> đã được chứng nhận an toàn bay. Phải hoàn thành kiểm tra chiều IMU/mixer và failsafe
+> không cánh trước khi lắp cánh.
 
 ## Chức năng
 
 - SBUS qua USART1; bốn kênh TIM3 phát DShot300 đồng bộ bằng DMA-burst.
-- MPU6500 qua SPI2: ước lượng góc và PID roll/pitch.
+- MPU6500 qua SPI2: ước lượng Roll/Pitch; bộ điều khiển góc + tốc độ góc dùng Roll/Pitch/Yaw.
 - DPS310 qua I2C1: đọc áp suất, nhiệt độ và độ cao tương đối để ghi log; không
   tham gia điều khiển.
 - MT-06 qua USART3: nhận khoảng cách MAVLink; dữ liệu chỉ dùng chẩn đoán.
@@ -20,7 +26,7 @@ bằng DShot300, đọc IMU MPU6500 và hỗ trợ cảm biến DPS310, MT-06.
 
 | Thiết bị / tín hiệu | Chân MCU | Ghi chú |
 | --- | --- | --- |
-| ESC 1–4 | PA6, PA4, PB0, PB1 | TIM3_CH1–CH4, DShot300 |
+| ESC 1–4 | PA6, PA7, PB0, PB1 | TIM3_CH1–CH4, DShot300 |
 | SBUS RX | PB7 | USART1_RX, 100000 baud, 8E2, đảo mức RX bật |
 | MPU6500 | PB13/PB14/PB15, CS PB12 | SPI2, mode 3 |
 | DPS310 | PB8/PB9 | I2C1 SCL/SDA; địa chỉ 0x76 hoặc 0x77 |
@@ -40,7 +46,7 @@ flowchart LR
     PC["Máy tính<br/>ST-LINK VCP"]
 
     RX -- "SBUS OUT → PB7<br/>USART1_RX" --> FC
-    FC -- "PA6 / PA4 / PB0 / PB1<br/>TIM3_CH1–CH4, DShot300" --> ESC
+    FC -- "PA6 / PA7 / PB0 / PB1<br/>TIM3_CH1–CH4, DShot300" --> ESC
     FC -- "PB13 SCK · PB14 MISO<br/>PB15 MOSI · PB12 CS" --> IMU
     FC -- "PB8 SCL · PB9 SDA<br/>I2C1" --> BARO
     RANGE -- "UART TX → PC11<br/>USART3_RX, 115200" --> FC
@@ -55,20 +61,24 @@ sử dụng. [PINOUT.png](PINOUT.png) tham khảo vị trí chân trên board.
 Kiểm tra điện áp, cực tính tín hiệu và sơ đồ chân của board/module thực tế
 trước khi đấu nối. I2C cần điện trở kéo lên phù hợp.
 
-Kênh SBUS mặc định: CH1 roll, CH2 pitch, CH3 ga, CH5 ARM, CH6 KILL. CH4 yaw
-chưa được điều khiển. Ngưỡng ga và công tắc trong mã là giá trị mặc định, cần
-đối chiếu với receiver/transmitter thực tế trước khi thử.
+Kênh SBUS mặc định: CH1 Roll, CH2 Pitch, CH3 ga, CH4 Yaw, CH5 ARM,
+CH6 KILL, CH7 Alt-Hold (đang bị tắt trong flight candidate). Tâm stick và dải ga
+được lấy từ log SBUS gần nhất trong project; nếu đổi transmitter/receiver hoặc
+trim stick, phải hiệu chuẩn lại.
 
 ## Trình tự ARM
 
-Firmware chỉ cho ARM sau khi ESC khởi tạo 2,5 giây, SBUS hợp lệ ổn định 1 giây,
-ga thấp ổn định 500 ms và IMU khởi tạo/hiệu chuẩn thành công. Đưa CH5 về OFF
-rồi bật ON để ARM; CH6 mức cao kích hoạt KILL. Mất link, frame-lost/failsafe,
-KILL hoặc lỗi IMU sẽ disarm.
+Trong flight candidate, pilot ARM được mở bằng cấu hình biên dịch; bộ quét ESC đã tắt.
+State machine vẫn yêu cầu SBUS mới và ổn định, KILL OFF, ga thấp ổn định, stick trung
+lập, IMU mới/đã calibration, frame gần ngang và DShot DMA phục hồi. Phải gạt ARM OFF
+trước, sau đó mới ON để tạo cạnh ARM hợp lệ. `AR=1` là Armed; `SP=1` chỉ xuất hiện
+sau khi ga vượt ngưỡng bắt đầu quay.
 
-**Thử không cánh quạt:** xác nhận chiều trục IMU, chiều bù PID, thứ tự/chiều
-quay motor, công tắc ARM/KILL và tín hiệu DShot bằng thiết bị đo trước khi
-xem xét thử nghiệm có cánh.
+**Trước khi lắp cánh:** hoàn thành checklist trong `FLIGHT_CANDIDATE_VI.md`.
+Đặc biệt kiểm tra bằng gá cố định và tháo đủ cánh: nghiêng phải thì cặp motor bên
+phải M2/M4 phải nhận correction tăng; chúi mũi xuống thì cặp trước M1/M2 phải nhận
+correction tăng. Tắt transmitter để xác nhận receiver tạo đúng failsafe pattern.
+Nếu một dấu bị ngược, không lắp cánh và không thử bay.
 
 ## Build
 
@@ -84,5 +94,8 @@ Firmware đầu ra: `build/Debug/UAV_.elf`.
 ## Tài liệu
 
 - [PINOUT.png](PINOUT.png): sơ đồ chân NUCLEO-G474RE.
-- [Tài Liệu/README_DShot300.md](<Tài Liệu/README_DShot300.md>): chi tiết DShot và tích hợp.
-- [Tài Liệu/TEST_RESULTS.md](<Tài Liệu/TEST_RESULTS.md>): kết quả kiểm tra và giới hạn xác minh.
+- [FLIGHT_CANDIDATE_VI.md](FLIGHT_CANDIDATE_VI.md): cấu hình, pre-arm và checklist trước cánh.
+
+## UAV Telemetry (STM32G474RE + ESP32-CAM AI-Thinker)
+
+Tài liệu sơ đồ UART/nguồn, packet protocol, firmware ESP32-CAM và Ground Station nằm tại [`Telemetry/README_VI.md`](Telemetry/README_VI.md).

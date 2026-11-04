@@ -1,18 +1,48 @@
-/* Bench-only two-loop controller. All gains are illustrative UNTUNED values.
- * Do NOT unlock motors based solely on model/simulation tuning. */
+/* Initial cascaded attitude/rate controller for FLIGHT CANDIDATE.
+ * ANGLE_KP and RATE_KP are provisional. RATE_KI and RATE_KD intentionally
+ * remain zero until real gyro noise, motor response and airframe dynamics are
+ * measured. This is not a validated/tuned flight PID. */
 #include "flight_pid.h"
 #include <math.h>
 #include <stddef.h>
 
-#define ANGLE_KP             4.0f     /* deg/s per deg angle error */
-#define MAX_RATE_DPS         80.0f
-#define RATE_KP_ROLL         1.5f     /* DShot counts / (deg/s) */
-#define RATE_KP_PITCH        1.5f
-#define RATE_KP_YAW          1.0f
-#define RATE_KI              0.0f     /* Await identified plant; no integral windup */
-#define RATE_KD              0.0f     /* Await gyro noise / sample-rate validation */
-#define INTEGRAL_LIMIT      30.0f
-#define CORRECTION_LIMIT  200.0f
+/* Deliberately preserve the original flight-candidate defaults. */
+static const FlightPIDGains default_gains = {
+    .angle_kp = 4.0f, .max_rate_dps = 80.0f,
+    .rate_kp = {1.5f, 1.5f, 1.0f},
+    .rate_ki = {0.0f, 0.0f, 0.0f},
+    .rate_kd = {0.0f, 0.0f, 0.0f},
+    .integral_limit = 30.0f, .correction_limit = 200.0f
+};
+static FlightPIDGains active_gains = {
+    .angle_kp = 4.0f, .max_rate_dps = 80.0f,
+    .rate_kp = {1.5f, 1.5f, 1.0f},
+    .rate_ki = {0.0f, 0.0f, 0.0f},
+    .rate_kd = {0.0f, 0.0f, 0.0f},
+    .integral_limit = 30.0f, .correction_limit = 200.0f
+};
+
+void FlightPID_DefaultGains(FlightPIDGains *g) { if (g) *g = default_gains; }
+void FlightPID_GetGains(FlightPIDGains *g) { if (g) *g = active_gains; }
+
+bool FlightPID_ValidateGains(const FlightPIDGains *g) {
+    if (!g || !isfinite(g->angle_kp) || g->angle_kp < 0.0f || g->angle_kp > 8.0f ||
+        !isfinite(g->max_rate_dps) || g->max_rate_dps < 1.0f || g->max_rate_dps > 150.0f ||
+        !isfinite(g->integral_limit) || g->integral_limit < 0.0f || g->integral_limit > 50.0f ||
+        !isfinite(g->correction_limit) || g->correction_limit < 1.0f || g->correction_limit > 250.0f) return false;
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!isfinite(g->rate_kp[i]) || g->rate_kp[i] < 0.0f || g->rate_kp[i] > 3.0f ||
+            !isfinite(g->rate_ki[i]) || g->rate_ki[i] < 0.0f || g->rate_ki[i] > 1.0f ||
+            !isfinite(g->rate_kd[i]) || g->rate_kd[i] < 0.0f || g->rate_kd[i] > 0.1f) return false;
+    }
+    return true;
+}
+
+bool FlightPID_SetGains(const FlightPIDGains *g) {
+    if (!FlightPID_ValidateGains(g)) return false;
+    active_gains = *g; /* Only main loop when disarmed; no ISR calls this. */
+    return true;
+}
 
 static float limit(float x, float bound) {
     return x > bound ? bound : (x < -bound ? -bound : x);
@@ -39,23 +69,23 @@ bool FlightPID_Step(FlightPIDState *s, const FlightPIDInput *in, FlightPIDOutput
     if (in->dt_s <= 0.0f || in->dt_s > 0.020f) { FlightPID_Reset(s); return false; }
     const float gyro[] = {in->gyro_roll_dps, in->gyro_pitch_dps, in->gyro_yaw_dps};
     const float target[] = {
-        limit(ANGLE_KP*(in->roll_set_deg-in->roll_deg),MAX_RATE_DPS),
-        limit(ANGLE_KP*(in->pitch_set_deg-in->pitch_deg),MAX_RATE_DPS),
-        limit(in->yaw_rate_set_dps,MAX_RATE_DPS)
+        limit(active_gains.angle_kp*(in->roll_set_deg-in->roll_deg),active_gains.max_rate_dps),
+        limit(active_gains.angle_kp*(in->pitch_set_deg-in->pitch_deg),active_gains.max_rate_dps),
+        limit(in->yaw_rate_set_dps,active_gains.max_rate_dps)
     };
-    const float kp[] = {RATE_KP_ROLL,RATE_KP_PITCH,RATE_KP_YAW};
+    const float *kp = active_gains.rate_kp;
     float u[3];
     for (unsigned i=0;i<3;++i) {
         float error=target[i]-gyro[i];
         float derivative=0.0f;
         if (s->has_prev) derivative=(gyro[i]-s->gyro_prev[i])/in->dt_s;
         s->gyro_deriv_filt[i] = 0.2f*derivative + 0.8f*s->gyro_deriv_filt[i];
-        float candidate_i = limit(s->integrator[i]+error*in->dt_s,INTEGRAL_LIMIT);
-        float unconstrained=kp[i]*error+RATE_KI*candidate_i-RATE_KD*s->gyro_deriv_filt[i];
-        if (in->allow_integrator && fabsf(unconstrained) < CORRECTION_LIMIT) {
+        float candidate_i = limit(s->integrator[i]+error*in->dt_s,active_gains.integral_limit);
+        float unconstrained=kp[i]*error+active_gains.rate_ki[i]*candidate_i-active_gains.rate_kd[i]*s->gyro_deriv_filt[i];
+        if (in->allow_integrator && fabsf(unconstrained) < active_gains.correction_limit) {
             s->integrator[i] = candidate_i;
         } else if (!in->allow_integrator) s->integrator[i] = 0.0f;
-        u[i]=limit(kp[i]*error+RATE_KI*s->integrator[i]-RATE_KD*s->gyro_deriv_filt[i],CORRECTION_LIMIT);
+        u[i]=limit(kp[i]*error+active_gains.rate_ki[i]*s->integrator[i]-active_gains.rate_kd[i]*s->gyro_deriv_filt[i],active_gains.correction_limit);
         s->gyro_prev[i]=gyro[i];
     }
     s->has_prev=true;

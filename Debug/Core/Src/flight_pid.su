@@ -1,8 +1,0 @@
-../Core/Src/flight_pid.c:17:14:limit	16	static
-../Core/Src/flight_pid.c:21:6:FlightPID_Reset	24	static
-../Core/Src/flight_pid.c:31:6:FlightPID_Step	136	static
-../Core/Src/flight_pid.c:66:6:FlightPID_MixX	24	static
-../Core/Src/flight_pid.c:85:6:FlightPIDSampleHold_Reset	16	static
-../Core/Src/flight_pid.c:94:6:FlightPIDSampleHold_Store	24	static
-../Core/Src/flight_pid.c:106:6:FlightPIDSampleHold_Read	24	static
-../Core/Src/flight_pid.c:112:6:FlightPID_DesaturateMixer	96	static

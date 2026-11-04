@@ -1,3 +1,9 @@
 build
 mx.scratch
-!.settings
+!.settings__pycache__/
+*.py[cod]
+Telemetry/GroundStation/*.csv
+
+# Wireless bridge credentials are local; never commit them.
+Telemetry/ESP32_CAM/secrets.h
+Telemetry/ESP32_CAM/.pio/

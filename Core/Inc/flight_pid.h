@@ -3,6 +3,23 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* 13 IEEE-754 little-endian floats exchanged over the configuration link.
+ * Runtime gains are modified only in the disarmed CONFIG mode. */
+typedef struct {
+    float angle_kp;
+    float max_rate_dps;
+    float rate_kp[3];
+    float rate_ki[3];
+    float rate_kd[3];
+    float integral_limit;
+    float correction_limit;
+} FlightPIDGains;
+
+void FlightPID_DefaultGains(FlightPIDGains *gains);
+void FlightPID_GetGains(FlightPIDGains *gains);
+bool FlightPID_ValidateGains(const FlightPIDGains *gains);
+bool FlightPID_SetGains(const FlightPIDGains *gains);
+
 typedef struct {
     float integrator[3];
     float gyro_prev[3];
@@ -22,7 +39,7 @@ typedef struct { float roll, pitch, yaw; } FlightPIDOutput;
 void FlightPID_Reset(FlightPIDState *state);
 bool FlightPID_Step(FlightPIDState *state, const FlightPIDInput *input, FlightPIDOutput *output);
 /* User-confirmed quad X map (looking from above, nose forward):
- * M1 front-left  CCW / PA6, M2 front-right CW  / PA4,
+ * M1 front-left  CCW / PA6, M2 front-right CW  / PA7,
  * M3 rear-left   CW  / PB0, M4 rear-right CCW / PB1.
  * Mixer assumes +roll right-side-down, +pitch nose-up, +yaw clockwise.
  * Physical IMU sign and torque response NOT YET VERIFIED.

@@ -27,6 +27,8 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/mt06.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/flight_pid.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/rc_input.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_telemetry.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_config.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_hal_msp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/sysmem.c

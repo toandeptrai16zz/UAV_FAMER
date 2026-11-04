@@ -1,0 +1,14 @@
+PASS runtime PID defaults, bounds, NAN rejection, atomic apply
+PASS physical CH8 config gate, ARM lock, no midflight CH8 disarm
+PASS all DShot payloads/CRC, SBUS 16-channel decode, RC neutral/low throttle
+PASS ARM edge, failed attempt, normal spin, KILL, no automatic rearm
+PASS SBUS failsafe/timeout/preset, DMA fault, invalid PID, PID time gap
+PASS fresh SPI after >20 ms gap cannot mask stale attitude or rearm
+PASS same-ms sample timestamp retains control without false dropout
+PASS complementary decay equivalence at 1/2 ms for static gyro input
+PASS mixer directions, 34,606 saturation cases, invalid input
+PASS CRC16 golden vector, v1 UDP frame+flag, UART request/response wire format
+PASS GCC -fsyntax-only: Core/Src/flight_pid.c, uav_config.c, uav_test.c (host HAL headers)
+PASS g++ -fsyntax-only: ESP32 .ino with local interface mocks (not actual Arduino core)
+PASS python3 -m py_compile: GroundStation/*.py
+NOT TESTED hardware: ARM cross build, ESP32 PlatformIO build, UART wiring, DBANK flash, ROM OTA, flight.
