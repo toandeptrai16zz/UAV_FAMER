@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "stm32g4xx_hal.h"
+#include "uav_rate_blackbox.h"
+#include "uav_imu_raw.h"
 
 #define UAV_TELEMETRY_PACKET_SIZE  88u
 #define UAV_TELEMETRY_VERSION      1u
@@ -22,6 +24,10 @@
 #define UAV_TELEM_FLAG_DMA_ERROR     (1u << 9)
 #define UAV_TELEM_FLAG_OUTPUT_ACTIVE (1u << 10)
 #define UAV_TELEM_FLAG_CONFIG_READY  (1u << 11)
+/* R5.1: reuse unused high bits of v1 flags; 88-byte frame is unchanged. */
+#define UAV_TELEM_CAGE_FAULT_SHIFT  12u
+#define UAV_TELEM_CAGE_FAULT_MASK   (7u << UAV_TELEM_CAGE_FAULT_SHIFT)
+#define UAV_TELEM_FLAG_CAGE_LATCHED (1u << 15)
 
 /* A snapshot only. This module never controls arming, PID, mixer or DShot. */
 typedef struct {
@@ -69,6 +75,12 @@ typedef struct {
 
 void UAVTelemetry_Reset(void);
 bool UAVTelemetry_Send(UART_HandleTypeDef *uart, const UAVTelemetrySample *sample);
+bool UAVTelemetry_SendBlackbox(UART_HandleTypeDef *uart, const UAVRateSample *sample,
+                               uint16_t index, uint16_t total, uint16_t capture_id);
+/* R5.5 type=3 raw IMU, only after motors have been disarmed. */
+bool UAVTelemetry_SendIMURaw(UART_HandleTypeDef *uart, const UAVIMURawSample *sample,
+                             uint16_t index, uint16_t total, uint16_t capture_id,
+                             uint16_t capture_kind, uint16_t hclk_mhz);
 void UAVTelemetry_OnTxComplete(UART_HandleTypeDef *uart);
 /* Returns true only when an in-flight telemetry TX was aborted by this error. */
 bool UAVTelemetry_OnTxError(UART_HandleTypeDef *uart);

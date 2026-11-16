@@ -12,7 +12,12 @@
 #include "rc_input.h"
 #include "mc7re_guard.h"
 #include "uav_telemetry.h"
+#include "uav_rate_blackbox.h"
+#include "uav_imu_raw.h"
+#include "uav_level_trim_user.h"
+#include "uav_cage_guard.h"
 #include "uav_config.h"
+#include "uav_config_gate.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -68,8 +73,13 @@ extern UART_HandleTypeDef huart3;
 #define CH_YAW                       3u
 #define CH_ARM                       4u
 #define CH_KILL                      5u
-#define CH_CONFIG                    7u  /* CH8, disarmed-only configuration */
-#define CONFIG_SWITCH_THRESHOLD      1500u
+/* The real MC6C transmitter has only six physical channels (CH1..CH6).
+ * CH5 = ARM, CH6 = KILL. CH7/CH8 cannot be required for normal operation.
+ * Change to 1 only if an eight-channel transmitter with a real, mapped
+ * CH8 CONFIG switch is installed and validated. */
+#define UAV_CONFIG_REQUIRE_CH8         0u
+#define CH_CONFIG                     7u /* SBUS index only, when above is 1 */
+#define CONFIG_SWITCH_THRESHOLD       1500u
 #define CH_ALT_HOLD                  6u  /* [THÊM MỚI] Kênh 6 dùng để bật bám ngọn cây */
 
 /* Switch thresholds */
@@ -87,7 +97,16 @@ extern UART_HandleTypeDef huart3;
 #define ESC_INIT_MS                 2500u
 #define ARM_LOW_HOLD_MS             500u
 #define LINK_STABLE_MS              1000u
-#define LOG_PERIOD_MS                200u /* Fast compact status: 5 Hz */
+/* When the 5 Hz ASCII report shares LPUART1 with binary telemetry,
+ * its long interrupt-driven TX occupies 2-3 of every 10 flight TX slots.
+ * This was measured as exactly two missing sequence numbers every 200 ms.
+ * Keep startup/critical ASCII diagnostics, disable periodic ASCII by default.
+ * 0 = reliable 50 Hz UDP telemetry; 1 = legacy ASCII diagnostics (not both).
+ */
+#ifndef UAV_SHARED_UART_PERIODIC_ASCII
+#define UAV_SHARED_UART_PERIODIC_ASCII 0u
+#endif
+#define LOG_PERIOD_MS                200u
 #define IMU_SAMPLE_PERIOD_MS        1u
 #define IMU_MAX_AGE_MS               20u
 #define SPI_TIMEOUT_MS              2u
@@ -112,14 +131,23 @@ extern UART_HandleTypeDef huart3;
  * Valid ONLY if the static test surface represents the intended level plane.
  * This is a one-off offset, not an in-flight auto-level algorithm; verify the
  * angle display on a known-level surface before allowing prop-on operation. */
+#ifndef IMU_ROLL_MOUNT_TRIM_DEG
 #define IMU_ROLL_MOUNT_TRIM_DEG      0.68f
+#endif
+#ifndef IMU_PITCH_MOUNT_TRIM_DEG
 #define IMU_PITCH_MOUNT_TRIM_DEG     0.24f
-/* FLIGHT CANDIDATE BUILD.
- * The bench scanner is compiled out and the pilot ARM state machine is enabled.
- * This does NOT certify motor order/direction or PID tuning: complete the
- * propeller-off mixer/axis checks in FLIGHT_CANDIDATE_VI.md first. */
+#endif
+/* R5.7 restricted-area flight trial: removes the old 5.5-second cage timer,
+ * automatic cage tilt/yaw/rate trips and temporary DShot 1550 ceiling.
+ * DOES NOT bypass manual KILL, SBUS loss/failsafe, IMU validity, DShot DMA
+ * interlocks, low-throttle pre-ARM or ARM switch edge requirements.
+ * Verify MOTOR ORDER, prop orientation and independent ESC power cutoff. */
+#ifndef UAV_CAGE_TEST_ARM_ENABLE
+#define UAV_CAGE_TEST_ARM_ENABLE       0u
+#endif
+/* The legacy flight candidate ARM machine remains underneath the new guard. */
 #define UAV_EXPERIMENTAL_ARM_ENABLE  1u
-#define UAV_EXPERIMENTAL_MAX_DSHOT   DSHOT_THROTTLE_MAX  /* full pilot throttle range */
+#define UAV_EXPERIMENTAL_MAX_DSHOT   (UAV_CAGE_TEST_ARM_ENABLE ? 1550u : DSHOT_THROTTLE_MAX)
 #define UAV_ARM_MAX_ANGLE_DEG       8.0f
 #define UAV_ARM_MAX_RATE_DPS       15.0f
 /* Use already measured MC6C SBUS endpoints (40..1640) from rc_input.h.
@@ -172,7 +200,33 @@ extern UART_HandleTypeDef huart3;
 #endif
 #define PID_ANGLE_LIMIT_DEG          25.0f
 #define PID_YAW_RATE_LIMIT_DPS       90.0f
-#define GYRO_LSB_PER_DPS              65.5f
+/* MPU6500 FS_SEL=3: +/-2000 dps, 16.4 LSB/(deg/s).
+ * Prior +/-500 dps (65.5 LSB/dps) clipped repeatedly at 501.1 deg/s
+ * in uav_20261116_163935.csv; clipped gyro invalidates rate PID feedback.
+ * Updating the register AND scale is mandatory. This fixes measurement
+ * saturation, NOT the as-yet-unverified physical yaw torque response. */
+#define MPU_GYRO_CONFIG_REG           0x1Bu
+#define MPU_GYRO_CONFIG_2000DPS       0x18u
+#define GYRO_LSB_PER_DPS              16.4f
+#define GYRO_CAL_STILLNESS_MAX_DPS    4.0f
+/* Important: gyro Z mounting sign is a PHYSICAL convention. With no motors,
+ * nose clockwise as seen from above must report POSITIVE gyro_yaw_dps.
+ * Do not change without physically confirming the sensor's orientation. */
+#define UAV_BODY_YAW_SENSOR_SIGN      (-1.0f)
+/* This release uses the standard pilot-ARM state machine, not R4's
+ * diagnostic motor-output lock. Safety interlocks above remain active. */
+#ifndef UAV_YAW_DIAGNOSTIC_ARM_LOCK
+#define UAV_YAW_DIAGNOSTIC_ARM_LOCK    0u
+#endif
+#if UAV_CAGE_TEST_ARM_ENABLE && UAV_YAW_DIAGNOSTIC_ARM_LOCK
+#error "CAGE ARM requested but diagnostic lock remains enabled"
+#endif
+#if UAV_CAGE_TEST_ARM_ENABLE && (UAV_PROPS_OFF_ESC_TEST || UAV_BENCH_ARM_LOCK || !UAV_EXPERIMENTAL_ARM_ENABLE)
+#error "CAGE mode conflicts with flight/bench output guards"
+#endif
+#if UAV_YAW_DIAGNOSTIC_ARM_LOCK && UAV_PROPS_OFF_ESC_TEST
+#error "Yaw diagnostic firmware must not run the motor scanner"
+#endif
 /* Original 0.98 per 1 ms = ~49.5 ms time constant: accelerometer
  * transients at high throttle can be mistaken for 10-20 degree tilt.
  * Use a provisional 0.5 s time constant, and downweight accelerometer
@@ -269,6 +323,7 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 static int16_t accel_x, accel_y, accel_z;
 static int16_t gyro_x, gyro_y, gyro_z;
 static bool imu_ready, imu_calibrated;
+static bool imu_raw_capture_ready;
 /* A successful SPI transfer alone does not prove attitude continuity. */
 static bool imu_control_valid;
 static uint32_t imu_gap_count, imu_dt_max_ms, motor_dt_max_ms, motor_late_count;
@@ -280,10 +335,23 @@ static uint32_t imu_read_errors, imu_last_good_ms, imu_sample_sequence, pid_last
 
 static int32_t gyro_bias_x_raw, gyro_bias_y_raw, gyro_bias_z_raw;
 static float roll_angle = 0.0f, pitch_angle = 0.0f;
+/* Base attitude stays in gravity/physical-mount coordinates. Only the
+ * angle controller and displayed roll/pitch are zeroed to a pilot-chosen
+ * disarmed reference pose; gyro bias and body rates are never touched. */
+static float control_roll_angle(void) { return roll_angle - UAVConfig_LevelRoll(); }
+static float control_pitch_angle(void) { return pitch_angle - UAVConfig_LevelPitch(); }
 static float sensor_roll_angle = 0.0f, sensor_pitch_angle = 0.0f;
 static bool attitude_initialized = false;
 static FlightPIDState flight_pid;
 static uint32_t last_pid_ms = 0, last_attitude_update_ms = 0;
+/* High-rate blackbox timing: DWT enables microsecond-scale loop diagnostics. */
+static uint32_t bb_cycles_per_us = 1u;
+static uint32_t bb_pid_dt_us = 0u;
+static uint16_t bb_motor_interval_us = 0u;
+static uint32_t bb_prev_motor_cycle = 0u;
+static uint32_t bb_last_sample_ms = 0u;
+static uint32_t bb_last_imu_seq = 0u;
+static uint32_t bb_last_tx_ms = 0u;
 
 /* [THÊM MỚI] Biến toàn cục lưu trữ PID độ cao */
 static float alt_integral = 0.0f;
@@ -317,7 +385,12 @@ static bool mpu6500_init_spi(void)
     if (mpu_write_reg(0x6Bu, 0x01u) != HAL_OK) return false;
     if (mpu_write_reg(0x19u, 0x00u) != HAL_OK) return false;
     if (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) return false;
-    if (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) return false;
+    if (mpu_write_reg(MPU_GYRO_CONFIG_REG, MPU_GYRO_CONFIG_2000DPS) != HAL_OK) return false;
+    /* Verify the actual silicon accepted the full-scale setting; do not
+     * silently run a 16.4 divisor when the gyro is still at +/-500. */
+    uint8_t gyro_cfg_readback = 0u;
+    if (mpu_read_regs(MPU_GYRO_CONFIG_REG, &gyro_cfg_readback, 1u) != HAL_OK ||
+        (gyro_cfg_readback & 0x18u) != MPU_GYRO_CONFIG_2000DPS) return false;
     if (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK) return false;
     /* ACCEL_CONFIG2: 41 Hz DLPF, 1 kHz output (TDK register map). */
     if (mpu_write_reg(0x1Du, 0x03u) != HAL_OK) return false;
@@ -334,7 +407,18 @@ static bool mpu6500_read_spi(void)
     gyro_x  = (int16_t)(((uint16_t)buffer[8]  << 8) | buffer[9]);
     gyro_y  = (int16_t)(((uint16_t)buffer[10] << 8) | buffer[11]);
     gyro_z  = (int16_t)(((uint16_t)buffer[12] << 8) | buffer[13]);
-    imu_last_good_ms = HAL_GetTick(); imu_sample_sequence++; return true;
+    imu_last_good_ms = HAL_GetTick(); imu_sample_sequence++;
+    /* Capture raw register values BEFORE scale/bias/attitude calculations.
+     * No serial I/O, heap allocation, floating point or filtering here. */
+    if (imu_raw_capture_ready) {
+        UAVIMURawSample rs = {0};
+        rs.tick_ms = imu_last_good_ms;
+        rs.cycle_count = DWT->CYCCNT;
+        rs.accel[0] = accel_x; rs.accel[1] = accel_y; rs.accel[2] = accel_z;
+        rs.gyro[0] = gyro_x; rs.gyro[1] = gyro_y; rs.gyro[2] = gyro_z;
+        UAVIMURaw_Push(&rs);
+    }
+    return true;
 }
 
 /* Reject calibration while moving or with implausible acceleration. */
@@ -366,8 +450,12 @@ static bool mpu6500_calibrate_gyro(void)
         HAL_Delay(2u);
     }
     if (valid_samples < 1425u) { imu_cal_failure_reason = 1u; return false; }
-    /* 260 raw counts range ~= 4 dps at +/-500dps; bench stillness screen. */
-    if ((max_x-min_x > 260) || (max_y-min_y > 260) || (max_z-min_z > 260)) {
+    /* The same +/-4 dps bench calibration tolerance in PHYSICAL units,
+     * rescaled for FS_SEL=3. A stale threshold of 260 raw counts would now
+     * accept ~16 dps motion and corrupt the gyro bias. */
+    const int32_t max_raw_range = (int32_t)(GYRO_CAL_STILLNESS_MAX_DPS * GYRO_LSB_PER_DPS + 0.5f);
+    if ((max_x-min_x > max_raw_range) || (max_y-min_y > max_raw_range) ||
+        (max_z-min_z > max_raw_range)) {
         imu_cal_failure_reason = 2u; return false;
     }
     gyro_bias_x_raw = (int32_t)(sum_x / (int64_t)valid_samples);
@@ -384,7 +472,7 @@ static float gyro_z_rate_dps(void) { return (float)(gyro_z - gyro_bias_z_raw) / 
  * Yaw sign was previously checked by manually rotating the airframe. */
 static float body_roll_rate_dps(void)  { return -gyro_y_rate_dps(); }
 static float body_pitch_rate_dps(void) { return -gyro_x_rate_dps(); }
-static float body_yaw_rate_dps(void)   { return -gyro_z_rate_dps(); }
+static float body_yaw_rate_dps(void)   { return UAV_BODY_YAW_SENSOR_SIGN * gyro_z_rate_dps(); }
 
 /* Accelerometer tilt is valid for gravity-dominated motion only.
  * A large norm departure is evidence of transient translational acceleration
@@ -553,6 +641,11 @@ static bool dshot_send_all(const uint16_t command[PWM_OUTPUT_COUNT]) {
 static uint32_t boot_ms;
 static bool armed, arm_ready, spinning, link_prev, throttle_filter_initialized, low_tracking, alt_hold_active;
 static bool uav_config_allowed;
+static UAVCageGuard cage_guard;
+static uint32_t bb_spinning_since;
+static bool bb_prev_cage_powered;
+static bool bb_prev_cage_latched;
+static UAVConfigGateState uav_config_gate;
 static bool arm_switch_prev;
 static uint32_t link_up_ms, low_since_ms;
 static uint16_t win_min, win_max, throttle_zero;
@@ -717,7 +810,9 @@ static void motor_step(void)
      * a steady near-level craft and zero-rate neutral sticks at ARM time.
      * Failsafe and KILL remain independent disarm gates below. */
     can_arm = imu_fresh && throttle_cal_ok && (UAV_BENCH_ARM_LOCK == 0u) &&
-              (UAV_EXPERIMENTAL_ARM_ENABLE == 1u);
+              (UAV_EXPERIMENTAL_ARM_ENABLE == 1u) &&
+              (UAV_YAW_DIAGNOSTIC_ARM_LOCK == 0u) &&
+              (!UAV_CAGE_TEST_ARM_ENABLE || !cage_guard.latched);
     const bool level_for_arm = isfinite(roll_angle) && isfinite(pitch_angle) &&
               fabsf(roll_angle) <= UAV_ARM_MAX_ANGLE_DEG &&
               fabsf(pitch_angle) <= UAV_ARM_MAX_ANGLE_DEG &&
@@ -736,7 +831,7 @@ static void motor_step(void)
      * 0x020 link stabilization, 0x040 throttle not low/stable 500ms,
      * 0x080 not level/still, 0x100 RC sticks off-center,
      * 0x200 MC7RE failsafe guard, 0x400 DShot has not recovered after a fault.
-     * 0x800 ARM switch off (normal, not an error).
+     * 0x800 ARM switch off (normal, not an error); 0x2000 yaw diagnostic lock.
      * This diagnostic does not change can_arm or motor output logic. */
     debug_arm_blockers = 0u;
     if (elapsed < ESC_INIT_MS) debug_arm_blockers |= 0x001u;
@@ -752,6 +847,8 @@ static void motor_step(void)
     if (!dshot_tx_recovered) debug_arm_blockers |= 0x400u;
     if (!arm_switch_on) debug_arm_blockers |= 0x800u;
     if (UAV_BENCH_ARM_LOCK != 0u) debug_arm_blockers |= 0x1000u;
+    if (UAV_YAW_DIAGNOSTIC_ARM_LOCK != 0u) debug_arm_blockers |= 0x2000u;
+    if (UAV_CAGE_TEST_ARM_ENABLE && cage_guard.latched) debug_arm_blockers |= 0x4000u;
     debug_link_stable = link_stable;
     debug_low_hold = stick_stable_low;
     debug_level_ok = level_for_arm;
@@ -762,7 +859,8 @@ static void motor_step(void)
     } else if (!arm_switch_on) {
         armed = false; arm_ready = true;
     } else if (!armed && arm_rising && arm_ready && link_stable && stick_stable_low &&
-               (channels[CH_CONFIG] < CONFIG_SWITCH_THRESHOLD) &&
+               ((UAV_CONFIG_REQUIRE_CH8 == 0u) ||
+                (channels[CH_CONFIG] < CONFIG_SWITCH_THRESHOLD)) &&
                level_for_arm && neutral_for_arm &&
                !mc7re_guard.latched && !mc7re_guard.candidate &&
                dshot_tx_recovered) {
@@ -838,8 +936,8 @@ static void motor_step(void)
                     .roll_set_deg = stick_to_angle_deg(channels[CH_ROLL], RC_ROLL_CENTER),
                     .pitch_set_deg = stick_to_angle_deg(channels[CH_PITCH], RC_PITCH_CENTER),
                     .yaw_rate_set_dps = RC_StickNormalized(channels[CH_YAW], RC_YAW_CENTER)*PID_YAW_RATE_LIMIT_DPS,
-                    .roll_deg = roll_angle,
-                    .pitch_deg = pitch_angle,
+                    .roll_deg = control_roll_angle(),
+                    .pitch_deg = control_pitch_angle(),
                     .gyro_roll_dps = body_roll_rate_dps(),
                     .gyro_pitch_dps = body_pitch_rate_dps(),
                     /* Body convention: positive yaw clockwise viewed from above.
@@ -854,6 +952,8 @@ static void motor_step(void)
                     .allow_integrator = armed && spinning &&
                         (fabsf(roll_angle) < 6.0f) &&
                         (fabsf(pitch_angle) < 6.0f) &&
+                        (fabsf(control_roll_angle()) < 6.0f) &&
+                        (fabsf(control_pitch_angle()) < 6.0f) &&
                         (fabsf(body_roll_rate_dps()) < 35.0f) &&
                         (fabsf(body_pitch_rate_dps()) < 35.0f) &&
                         (fabsf(body_yaw_rate_dps()) < 35.0f) &&
@@ -861,6 +961,7 @@ static void motor_step(void)
                         (fabsf(RC_StickNormalized(channels[CH_PITCH], RC_PITCH_CENTER)) < 0.02f) &&
                         (fabsf(RC_StickNormalized(channels[CH_YAW], RC_YAW_CENTER)) < 0.02f)
                 };
+                bb_pid_dt_us = dt_ms * 1000u;
                 FlightPIDOutput out;
                 if (FlightPID_Step(&flight_pid, &in, &out)) {
                     (void)FlightPIDSampleHold_Store(&pid_sample_hold, &out, now);
@@ -1068,6 +1169,52 @@ static void motor_step(void)
     debug_bench_motor = 0u;
 #endif
 
+    /* R3 diagnosis: independent LAST-LINE motor-output interlock.
+     * No bench scan or flight output is permitted in this diagnostic build,
+     * including if another part of the state machine ever sets armed=true.
+     * This is deliberately independent from SBUS ARM, KILL and CONFIG. */
+#if UAV_YAW_DIAGNOSTIC_ARM_LOCK
+    armed = false;
+    spinning = false;
+    arm_ready = false;
+    throttle_ratio = 0.0f;
+    outputs_force_zero();
+#endif
+#if UAV_CAGE_TEST_ARM_ENABLE
+    /* Independent FINAL-LINE captive test guard; cannot be bypassed by
+     * PID, configuration writes, motor mixing or the ARM state machine.
+     * Once a run ends/trips, reset power before another cage experiment. */
+    const UAVCageInputs cage_in = {
+        .now_ms=now, .armed=armed, .spinning=spinning,
+        .pilot_stopped=link_ok && (kill_switch_on || !arm_switch_on),
+        .input_ok=imu_fresh && link_ok && !kill_switch_on &&
+                  !mc7re_guard.latched && !mc7re_guard.candidate &&
+                  dshot_dma_error_pending==0u,
+        .yaw_dps=body_yaw_rate_dps(),
+        .roll_dps=body_roll_rate_dps(),
+        .pitch_dps=body_pitch_rate_dps(),
+        .roll_deg=roll_angle, .pitch_deg=pitch_angle
+    };
+    if (UAVCage_Update(&cage_guard, &cage_in)) {
+        armed=false; spinning=false; arm_ready=false;
+        throttle_ratio=0.0f; outputs_force_zero();
+    }
+    /* A normal pilot stop / 5.5s timeout is a *completed* test, not an
+     * unsafe flight fault. Allow another attempt ONLY after a deliberate
+     * disarmed safe hold. Never clear FAST_YAW / ATTITUDE / RATE / INPUT faults. */
+    const bool cage_safe_clear = UAVCage_IsBenignStop(&cage_guard) &&
+        !arm_switch_on && kill_switch_on && throttle_low &&
+        link_stable && imu_fresh && level_for_arm && neutral_for_arm &&
+        dshot_dma_error_pending == 0u && dshot_tx_recovered &&
+        !mc7re_guard.latched && !mc7re_guard.candidate &&
+        !armed && !spinning &&
+        ((output_dshot[0] | output_dshot[1] |
+          output_dshot[2] | output_dshot[3]) == 0u);
+    /* Wait for the buffered PID capture to finish downloading before clearing
+     * the latched fault, so the Dashboard can still show the stop reason. */
+    (void)UAVCage_TryClearBenign(&cage_guard, now,
+                                cage_safe_clear && !UAVBB_Dumping());
+#endif
     /* V335: guarded pilot-throttle attitude mixer.  Neither SBUS transport
      * nor this code proves RF is present when MC7RE repeats old channels. */
     if (!dshot_send_all(output_dshot)) {
@@ -1084,13 +1231,24 @@ static void motor_step(void)
 #endif
     }
 
-    /* Physical RC permission, recomputed every motor tick from the guarded
-     * link. CH8 high blocks ARM; CONFIG never bypasses KILL or failsafe. */
-    uav_config_allowed = link_stable && !mc7re_guard.latched &&
-                         (channels[CH_CONFIG] >= CONFIG_SWITCH_THRESHOLD) &&
-                         kill_switch_on && !arm_switch_on &&
-                         throttle_low && !armed && !spinning &&
-                         !bench_pulse_active && !bench_pulse_pending;
+    /* MC6C six-channel safe PID write permission (no nonexistent CH8).
+     * Require continuous RC safety for >= 2 seconds; immediately revoke on
+     * KILL OFF, ARM ON, throttle increase, RF loss or any motor output.
+     * The existing Wi-Fi authentication/physical props-off confirmation are
+     * additional independent restrictions, not replacements for this gate. */
+    const UAVConfigGateInputs config_inputs = {
+        .link_stable = link_stable,
+        .rf_guard_ok = !mc7re_guard.latched && !mc7re_guard.candidate,
+        .config_switch_on = (UAV_CONFIG_REQUIRE_CH8 == 0u) ||
+                            (channels[CH_CONFIG] >= CONFIG_SWITCH_THRESHOLD),
+        .kill_on = kill_switch_on,
+        .arm_on = arm_switch_on,
+        .throttle_low = throttle_low,
+        .armed = armed,
+        .spinning = spinning,
+        .bench_in_progress = bench_pulse_active || bench_pulse_pending,
+    };
+    uav_config_allowed = UAVConfigGate_Update(&uav_config_gate, now, &config_inputs);
 
     debug_age_ms = age_ms; debug_frames_ok = frames_ok; debug_frames_bad = frames_bad; debug_uart_errors = uart_errors;
     debug_link_ok = link_ok; debug_imu_ok = imu_fresh; debug_throttle_cal_ok = throttle_cal_ok;
@@ -1142,14 +1300,18 @@ static void telemetry_publish(uint32_t now_ms)
     if (imu_ready && imu_calibrated) sample.flags |= UAV_TELEM_FLAG_IMU_CAL;
     if (current_range_valid) sample.flags |= UAV_TELEM_FLAG_RANGE_VALID;
     if (dshot_dma_error_pending != 0u) sample.flags |= UAV_TELEM_FLAG_DMA_ERROR;
+#if UAV_CAGE_TEST_ARM_ENABLE
+    sample.flags |= ((uint16_t)cage_guard.fault & 7u) << UAV_TELEM_CAGE_FAULT_SHIFT;
+    if (cage_guard.latched) sample.flags |= UAV_TELEM_FLAG_CAGE_LATCHED;
+#endif
 
     sample.rc_throttle = debug_throttle;
     sample.rc_roll = debug_roll;
     sample.rc_pitch = debug_pitch;
     sample.rc_yaw = debug_yaw;
 
-    sample.roll_cdeg = telemetry_i16_scaled(roll_angle, 100.0f);
-    sample.pitch_cdeg = telemetry_i16_scaled(pitch_angle, 100.0f);
+    sample.roll_cdeg = telemetry_i16_scaled(control_roll_angle(), 100.0f);
+    sample.pitch_cdeg = telemetry_i16_scaled(control_pitch_angle(), 100.0f);
     sample.gyro_roll_dps_x10 = telemetry_i16_scaled(body_roll_rate_dps(), 10.0f);
     sample.gyro_pitch_dps_x10 = telemetry_i16_scaled(body_pitch_rate_dps(), 10.0f);
     sample.gyro_yaw_dps_x10 = telemetry_i16_scaled(body_yaw_rate_dps(), 10.0f);
@@ -1184,6 +1346,70 @@ static void telemetry_publish(uint32_t now_ms)
     (void)UAVTelemetry_Send(&hlpuart1, &sample);
 }
 
+/* R5 high-rate blackbox: sample real motor outputs while spinning in cage.
+ * Ring is written in the control loop; UART transfer is deferred until
+ * disarmed, KILL ON and all outputs have stopped. */
+static void bb_record_if_due(uint32_t now_ms, bool kill_on)
+{
+    /* A motor shutdown may coincide with an invalid/stale IMU or occur less
+     * than 5 ms after the last Blackbox sample. Preserve the final powered
+     * window even when the normal sample-rate gate rejects this tick. */
+    const bool motor_now_on = armed && spinning && !kill_on &&
+        ((output_dshot[0] | output_dshot[1] |
+          output_dshot[2] | output_dshot[3]) != 0u);
+    if (bb_prev_cage_powered && !motor_now_on) {
+        UAVIMURaw_MotorStopped();
+        UAVBB_FreezeNow();
+        bb_prev_cage_powered = false;
+    }
+    if (!imu_control_valid || imu_sample_sequence == bb_last_imu_seq ||
+        (uint32_t)(now_ms - bb_last_sample_ms) < UAV_BB_PERIOD_MS) return;
+    bb_last_imu_seq = imu_sample_sequence;
+    bb_last_sample_ms = now_ms;
+    UAVRateSample s = {0};
+    s.stamp_ms = now_ms;
+    s.pid_dt_us = (bb_pid_dt_us > 65535u) ? 65535u : (uint16_t)bb_pid_dt_us;
+    s.motor_dt_us = bb_motor_interval_us;
+    for (unsigned a = 0u; a < 3u; ++a) {
+        s.gyro_x10[a] = telemetry_i16_scaled(
+            a == 0u ? body_roll_rate_dps() : a == 1u ? body_pitch_rate_dps() : body_yaw_rate_dps(),10.0f);
+        s.set_x10[a] = telemetry_i16_scaled(flight_pid.rate_set_dps[a], 10.0f);
+        s.p_x10[a] = telemetry_i16_scaled(flight_pid.pid_p[a], 10.0f);
+        s.i_x10[a] = telemetry_i16_scaled(flight_pid.pid_i[a], 10.0f);
+        s.d_x10[a] = telemetry_i16_scaled(flight_pid.pid_d[a], 10.0f);
+    }
+    for (unsigned m = 0u; m < 4u; ++m) s.motor[m] = output_dshot[m];
+    s.base = telemetry_u16_scaled(debug_base_command, 1.0f);
+    s.mixer_scale_x1000 = telemetry_u16_scaled(debug_mixer_scale, 1000.0f);
+    s.imu_seq_lsb = (uint16_t)imu_sample_sequence;
+    if (armed) s.flags |= 1u;
+    if (spinning) s.flags |= 2u;
+    if (kill_on) s.flags |= 4u;
+    if (dshot_dma_error_pending) s.flags |= 8u;
+    FlightPIDGains gains;
+    FlightPID_GetGains(&gains);
+    if (fabsf(debug_pid_yaw) >= gains.correction_limit - 0.5f) s.flags |= 16u;
+    if (armed && debug_mixer_scale < 0.999f) s.flags |= 32u;
+    const float mag = fmaxf(fabsf(body_yaw_rate_dps()),
+                           fmaxf(fabsf(body_roll_rate_dps()), fabsf(body_pitch_rate_dps())));
+    const bool motors_on = (s.motor[0] | s.motor[1] | s.motor[2] | s.motor[3]) != 0u;
+    /* Record every NORMAL powered run, not just cage-mode sessions.
+     * Capture a rolling IMU window during flight and freeze it at pilot stop
+     * or any disarm; transmit only after motors are zero and KILL is ON. */
+    const bool motors_powered = armed && spinning && motors_on && !kill_on;
+    if (motors_powered && bb_spinning_since==0u) bb_spinning_since=now_ms;
+    const bool motor_just_started = !bb_prev_cage_powered && motors_powered;
+    const bool motor_just_stopped = bb_prev_cage_powered && !motors_powered;
+    if (motor_just_started) UAVIMURaw_MotorStarted();
+    if (motor_just_stopped) UAVIMURaw_MotorStopped();
+    bb_prev_cage_powered = motors_powered;
+    if (!motors_powered) bb_spinning_since=0u;
+    const bool passive_trigger = !armed && !spinning &&
+          kill_on && !motors_on && mag>=45.0f;
+    UAVBB_Push(&s, passive_trigger);
+    if (motor_just_stopped) UAVBB_FreezeNow();
+}
+
 /* ----------------------------- Public API ----------------------------- */
 void uav_test_init(void)
 {
@@ -1194,7 +1420,8 @@ void uav_test_init(void)
 
     mc7re_guard_init(&mc7re_guard);
     debug_rf_guard_reason = 5u; debug_rf_preset = false; debug_rf_latched = true;
-    armed = false; arm_ready = false; arm_switch_prev = false; spinning = false; uav_config_allowed = false; link_prev = false; throttle_filter_initialized = false; low_tracking = false;
+    armed = false; arm_ready = false; arm_switch_prev = false; spinning = false; uav_config_allowed = false;
+    UAVConfigGate_Reset(&uav_config_gate); link_prev = false; throttle_filter_initialized = false; low_tracking = false;
     imu_control_valid = false;
     imu_gap_count = 0u; imu_dt_max_ms = 0u; motor_dt_max_ms = 0u; motor_late_count = 0u;
     throttle_ratio = 0.0f; imu_read_errors = 0u; imu_last_good_ms = 0u; imu_sample_sequence = 0u; pid_last_sample_sequence = 0u;
@@ -1203,6 +1430,19 @@ void uav_test_init(void)
     sbus_frame_pos = 0u; sbus_rx_rearm_pending = 1u;
     FlightPID_Reset(&flight_pid); FlightPIDSampleHold_Reset(&pid_sample_hold);
     UAVTelemetry_Reset();
+    UAVBB_Reset();
+    UAVIMURaw_Reset();
+    imu_raw_capture_ready = false;
+    UAVCage_Init(&cage_guard);
+    bb_spinning_since=0u; bb_prev_cage_powered=false;
+    bb_prev_cage_latched=false;
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0u;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    bb_cycles_per_us = HAL_RCC_GetHCLKFreq() / 1000000u;
+    if (bb_cycles_per_us == 0u) bb_cycles_per_us = 1u;
+    bb_prev_motor_cycle = bb_last_sample_ms = bb_last_imu_seq = bb_last_tx_ms = bb_pid_dt_us = 0u;
+    bb_motor_interval_us = 0u;
     UAVConfig_Init(&hlpuart1);
     for (uint8_t i = 0u; i < PWM_OUTPUT_COUNT; ++i) debug_requested[i] = 0u;
     bench_pulse_pending = false; bench_pulse_active = false;
@@ -1224,6 +1464,8 @@ void uav_test_init(void)
 
     imu_ready = mpu6500_init_spi(); imu_calibrated = false;
     if (imu_ready) imu_calibrated = mpu6500_calibrate_gyro();
+    /* Only capture after the 3-second gyro-bias calibration, not during it. */
+    imu_raw_capture_ready = imu_ready && imu_calibrated;
     last_attitude_update_ms = HAL_GetTick();
 
 #if ENABLE_ATTITUDE_PID
@@ -1239,7 +1481,10 @@ void uav_test_init(void)
     if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
 
     boot_ms = HAL_GetTick(); sbus_service_receive_restart();
-    log_async("FLIGHT_CANDIDATE: ARM_ENABLE=%u ARM_LOCK=%u SCAN=%u ALT_HOLD=%u IMU=%u CAL=%u\r\n",
+    log_async("YAW_R5_1: CAGE=%u DIAG_LOCK=%u GYRO_FS=2000dps YSIGN=%ld ARM_ENABLE=%u ARM_LOCK=%u SCAN=%u ALT_HOLD=%u IMU=%u CAL=%u\r\n",
+              (unsigned)UAV_CAGE_TEST_ARM_ENABLE,
+              (unsigned)UAV_YAW_DIAGNOSTIC_ARM_LOCK,
+              (long)UAV_BODY_YAW_SENSOR_SIGN,
               (unsigned)UAV_EXPERIMENTAL_ARM_ENABLE,
               (unsigned)UAV_BENCH_ARM_LOCK,
               (unsigned)UAV_PROPS_OFF_ESC_TEST,
@@ -1307,10 +1552,37 @@ void uav_test_loop(void)
             if (interval > DSHOT_CONTROL_PERIOD_MS) motor_late_count++;
         }
         last_motor_update_ms = now;
+        const uint32_t motor_cycle = DWT->CYCCNT;
+        if (bb_prev_motor_cycle != 0u) {
+            const uint32_t delta_us = (motor_cycle - bb_prev_motor_cycle) / bb_cycles_per_us;
+            bb_motor_interval_us = delta_us > 65535u ? 65535u : (uint16_t)delta_us;
+        }
+        bb_prev_motor_cycle = motor_cycle;
         motor_step();
+        /* Capture only after final motor interlock and DShot output selection. */
+        bb_record_if_due(now, debug_kill >= KILL_SWITCH_THRESHOLD);
+#if UAV_CAGE_TEST_ARM_ENABLE
+        /* A trip can occur before the Blackbox post-trigger window ends,
+         * or while the IMU is invalid. Freeze pre-event samples immediately.
+         * Transmission still waits until disarmed, KILL ON and motors zero. */
+        const bool cage_trip_now = cage_guard.latched && !bb_prev_cage_latched;
+        bb_prev_cage_latched = cage_guard.latched;
+        if (cage_trip_now) UAVBB_FreezeNow();
+#endif
     }
     /* This command service never runs in an IRQ and never waits for Wi-Fi.
      * RC data is still read by the normal SBUS failsafe path. */
+    /* Observe a full 2-second stationary pose before an explicit capture.
+     * Even a CONFIG request cannot sample while a motor is commanded. */
+    const bool level_ref_safe = uav_config_allowed && imu_ready && imu_calibrated &&
+        imu_control_valid && attitude_initialized &&
+        (uint32_t)(now - imu_last_good_ms) <= IMU_MAX_AGE_MS &&
+        !armed && !spinning &&
+        (output_dshot[0] | output_dshot[1] | output_dshot[2] | output_dshot[3]) == 0u;
+    UAVConfig_LevelObserve(roll_angle, pitch_angle,
+        body_roll_rate_dps(), body_pitch_rate_dps(), body_yaw_rate_dps(),
+        accel_tilt_confidence((float)accel_x,(float)accel_y,(float)accel_z),
+        level_ref_safe);
     UAVConfig_Service(uav_config_allowed);
     UAVConfig_ServiceBoot(uav_config_allowed);
 
@@ -1318,12 +1590,11 @@ void uav_test_loop(void)
     now = HAL_GetTick();
     (void)DPS310_GetData(&barometer, &baro_data);
 
-    /* FLIGHT CANDIDATE telemetry.
-     * B/M/CMD are zero because the props-off scanner is compiled out.
-     * O is the actual DShot command vector. Do not use this candidate for
-     * powered flight until the propeller-off axis/mixer checks pass.
+    /* R5.7 flight telemetry: O is the actual four-channel DShot vector.
+     * All PID200 and IMU1000 capture is retained after pilot DISARM + KILL.
      */
-    if ((now - last_log_ms) >= LOG_PERIOD_MS) {
+    if (UAV_SHARED_UART_PERIODIC_ASCII && !UAVBB_Dumping() &&
+        (now - last_log_ms) >= LOG_PERIOD_MS) {
         const bool rc_neutral = debug_link_ok &&
             ((debug_roll > RC_ROLL_CENTER ? debug_roll - RC_ROLL_CENTER : RC_ROLL_CENTER - debug_roll) <= RC_STICK_DEADBAND) &&
             ((debug_pitch > RC_PITCH_CENTER ? debug_pitch - RC_PITCH_CENTER : RC_PITCH_CENTER - debug_pitch) <= RC_STICK_DEADBAND) &&
@@ -1403,11 +1674,61 @@ void uav_test_loop(void)
                   (long)(flight_pid.pid_i[2] * 10.0f));
     }
 
-    /* Binary telemetry follows the 1 Hz ASCII status write on the same UART.
-     * If the port is still busy, this snapshot is dropped; motor control never waits. */
+    /* UART service: no waits in 1 ms PID/motor loop.
+     * After PID200, upload IMU1000 (type 3) at up to 2 of every 3 slots;
+     * retain a flight telemetry heartbeat in the third slot.
+     * During PID200 Blackbox upload continue type-1 flight telemetry at
+     * least every 60 ms (one out of 3 x 20 ms slots), and send type-2
+     * records in the other slots. This prevents the Ground Station from
+     * reporting an apparent disconnect during the ~15.4 s bulk download.
+     * Both packet types are non-blocking and 88 bytes at 115200 baud. */
     now = HAL_GetTick();
+    UAVBB_Tick(now);
     if ((uint32_t)(now - last_telemetry_ms) >= UAV_TELEMETRY_PERIOD_MS) {
+        static uint8_t bb_upload_slot = 0u;
         last_telemetry_ms = now;
-        telemetry_publish(now);
+        UAVRateSample record;
+        uint16_t record_index, record_count, capture_id;
+        /* Never upload Blackbox while motor power is commanded.
+         * In cage mode a latched guard prevents rearming during transfer;
+         * normal disarmed download requires KILL ON. */
+        const bool bb_download_safe = !armed && !spinning &&
+          (output_dshot[0] | output_dshot[1] |
+           output_dshot[2] | output_dshot[3]) == 0u &&
+          ((debug_kill >= KILL_SWITCH_THRESHOLD) ||
+           (UAV_CAGE_TEST_ARM_ENABLE && cage_guard.latched));
+        if (bb_download_safe && UAVBB_Peek(&record, &record_index,
+                                           &record_count, &capture_id)) {
+            bb_upload_slot++;
+            if (bb_upload_slot >= 3u) {
+                bb_upload_slot = 0u;
+                telemetry_publish(now);
+            } else if (UAVTelemetry_SendBlackbox(&hlpuart1, &record,
+                                                  record_index, record_count,
+                                                  capture_id)) {
+                UAVBB_Sent();
+            }
+        } else if (bb_download_safe) {
+            UAVIMURawSample imu_record;
+            uint16_t raw_idx, raw_count, raw_capture, raw_kind;
+            if (UAVIMURaw_Peek(&imu_record, &raw_idx, &raw_count,
+                               &raw_capture, &raw_kind)) {
+                bb_upload_slot++;
+                if (bb_upload_slot >= 3u) {
+                    bb_upload_slot = 0u;
+                    telemetry_publish(now);
+                } else if (UAVTelemetry_SendIMURaw(&hlpuart1, &imu_record,
+                            raw_idx, raw_count, raw_capture, raw_kind,
+                            (uint16_t)(HAL_RCC_GetHCLKFreq()/1000000u))) {
+                    UAVIMURaw_Sent();
+                }
+            } else {
+                bb_upload_slot = 0u;
+                telemetry_publish(now);
+            }
+        } else {
+            bb_upload_slot = 0u;
+            telemetry_publish(now);
+        }
     }
 }

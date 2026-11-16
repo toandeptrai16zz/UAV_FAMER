@@ -1,0 +1,236 @@
+--- a/Core/Src/uav_test.c
++++ b/Core/Src/uav_test.c
+@@ -178,7 +178,30 @@
+ #endif
+ #define PID_ANGLE_LIMIT_DEG          25.0f
+ #define PID_YAW_RATE_LIMIT_DPS       90.0f
+-#define GYRO_LSB_PER_DPS              65.5f
++/* MPU6500 FS_SEL=3: +/-2000 dps, 16.4 LSB/(deg/s).
++ * Prior +/-500 dps (65.5 LSB/dps) clipped repeatedly at 501.1 deg/s
++ * in uav_20261116_163935.csv; clipped gyro invalidates rate PID feedback.
++ * Updating the register AND scale is mandatory. This fixes measurement
++ * saturation, NOT the as-yet-unverified physical yaw torque response. */
++#define MPU_GYRO_CONFIG_REG           0x1Bu
++#define MPU_GYRO_CONFIG_2000DPS       0x18u
++#define GYRO_LSB_PER_DPS              16.4f
++#define GYRO_CAL_STILLNESS_MAX_DPS    4.0f
++/* Important: gyro Z mounting sign is a PHYSICAL convention. With no motors,
++ * nose clockwise as seen from above must report POSITIVE gyro_yaw_dps.
++ * Do not change without physically confirming the sensor's orientation. */
++#define UAV_BODY_YAW_SENSOR_SIGN      (-1.0f)
++/* Diagnostic firmware is intentionally non-flying. The latest powered run
++ * reached the old gyro measurement rail and showed contradictory response
++ * between requested yaw torque and yaw acceleration. Diagnose signs first.
++ * This macro may only be cleared after a shielded, instrumented torque check.
++ * It is separate from KILL/ARM logic and MUST NOT bypass either. */
++#ifndef UAV_YAW_DIAGNOSTIC_ARM_LOCK
++#define UAV_YAW_DIAGNOSTIC_ARM_LOCK    1u
++#endif
++#if UAV_YAW_DIAGNOSTIC_ARM_LOCK && UAV_PROPS_OFF_ESC_TEST
++#error "Yaw diagnostic firmware must not run the motor scanner"
++#endif
+ /* Original 0.98 per 1 ms = ~49.5 ms time constant: accelerometer
+  * transients at high throttle can be mistaken for 10-20 degree tilt.
+  * Use a provisional 0.5 s time constant, and downweight accelerometer
+@@ -323,7 +346,12 @@
+     if (mpu_write_reg(0x6Bu, 0x01u) != HAL_OK) return false;
+     if (mpu_write_reg(0x19u, 0x00u) != HAL_OK) return false;
+     if (mpu_write_reg(0x1Au, 0x03u) != HAL_OK) return false;
+-    if (mpu_write_reg(0x1Bu, 0x08u) != HAL_OK) return false;
++    if (mpu_write_reg(MPU_GYRO_CONFIG_REG, MPU_GYRO_CONFIG_2000DPS) != HAL_OK) return false;
++    /* Verify the actual silicon accepted the full-scale setting; do not
++     * silently run a 16.4 divisor when the gyro is still at +/-500. */
++    uint8_t gyro_cfg_readback = 0u;
++    if (mpu_read_regs(MPU_GYRO_CONFIG_REG, &gyro_cfg_readback, 1u) != HAL_OK ||
++        (gyro_cfg_readback & 0x18u) != MPU_GYRO_CONFIG_2000DPS) return false;
+     if (mpu_write_reg(0x1Cu, 0x08u) != HAL_OK) return false;
+     /* ACCEL_CONFIG2: 41 Hz DLPF, 1 kHz output (TDK register map). */
+     if (mpu_write_reg(0x1Du, 0x03u) != HAL_OK) return false;
+@@ -372,8 +400,12 @@
+         HAL_Delay(2u);
+     }
+     if (valid_samples < 1425u) { imu_cal_failure_reason = 1u; return false; }
+-    /* 260 raw counts range ~= 4 dps at +/-500dps; bench stillness screen. */
+-    if ((max_x-min_x > 260) || (max_y-min_y > 260) || (max_z-min_z > 260)) {
++    /* The same +/-4 dps bench calibration tolerance in PHYSICAL units,
++     * rescaled for FS_SEL=3. A stale threshold of 260 raw counts would now
++     * accept ~16 dps motion and corrupt the gyro bias. */
++    const int32_t max_raw_range = (int32_t)(GYRO_CAL_STILLNESS_MAX_DPS * GYRO_LSB_PER_DPS + 0.5f);
++    if ((max_x-min_x > max_raw_range) || (max_y-min_y > max_raw_range) ||
++        (max_z-min_z > max_raw_range)) {
+         imu_cal_failure_reason = 2u; return false;
+     }
+     gyro_bias_x_raw = (int32_t)(sum_x / (int64_t)valid_samples);
+@@ -390,7 +422,7 @@
+  * Yaw sign was previously checked by manually rotating the airframe. */
+ static float body_roll_rate_dps(void)  { return -gyro_y_rate_dps(); }
+ static float body_pitch_rate_dps(void) { return -gyro_x_rate_dps(); }
+-static float body_yaw_rate_dps(void)   { return -gyro_z_rate_dps(); }
++static float body_yaw_rate_dps(void)   { return UAV_BODY_YAW_SENSOR_SIGN * gyro_z_rate_dps(); }
+ 
+ /* Accelerometer tilt is valid for gravity-dominated motion only.
+  * A large norm departure is evidence of transient translational acceleration
+@@ -724,7 +756,8 @@
+      * a steady near-level craft and zero-rate neutral sticks at ARM time.
+      * Failsafe and KILL remain independent disarm gates below. */
+     can_arm = imu_fresh && throttle_cal_ok && (UAV_BENCH_ARM_LOCK == 0u) &&
+-              (UAV_EXPERIMENTAL_ARM_ENABLE == 1u);
++              (UAV_EXPERIMENTAL_ARM_ENABLE == 1u) &&
++              (UAV_YAW_DIAGNOSTIC_ARM_LOCK == 0u);
+     const bool level_for_arm = isfinite(roll_angle) && isfinite(pitch_angle) &&
+               fabsf(roll_angle) <= UAV_ARM_MAX_ANGLE_DEG &&
+               fabsf(pitch_angle) <= UAV_ARM_MAX_ANGLE_DEG &&
+@@ -743,7 +776,7 @@
+      * 0x020 link stabilization, 0x040 throttle not low/stable 500ms,
+      * 0x080 not level/still, 0x100 RC sticks off-center,
+      * 0x200 MC7RE failsafe guard, 0x400 DShot has not recovered after a fault.
+-     * 0x800 ARM switch off (normal, not an error).
++     * 0x800 ARM switch off (normal, not an error); 0x2000 yaw diagnostic lock.
+      * This diagnostic does not change can_arm or motor output logic. */
+     debug_arm_blockers = 0u;
+     if (elapsed < ESC_INIT_MS) debug_arm_blockers |= 0x001u;
+@@ -759,6 +792,7 @@
+     if (!dshot_tx_recovered) debug_arm_blockers |= 0x400u;
+     if (!arm_switch_on) debug_arm_blockers |= 0x800u;
+     if (UAV_BENCH_ARM_LOCK != 0u) debug_arm_blockers |= 0x1000u;
++    if (UAV_YAW_DIAGNOSTIC_ARM_LOCK != 0u) debug_arm_blockers |= 0x2000u;
+     debug_link_stable = link_stable;
+     debug_low_hold = stick_stable_low;
+     debug_level_ok = level_for_arm;
+@@ -1076,6 +1110,17 @@
+     debug_bench_motor = 0u;
+ #endif
+ 
++    /* R3 diagnosis: independent LAST-LINE motor-output interlock.
++     * No bench scan or flight output is permitted in this diagnostic build,
++     * including if another part of the state machine ever sets armed=true.
++     * This is deliberately independent from SBUS ARM, KILL and CONFIG. */
++#if UAV_YAW_DIAGNOSTIC_ARM_LOCK
++    armed = false;
++    spinning = false;
++    arm_ready = false;
++    throttle_ratio = 0.0f;
++    outputs_force_zero();
++#endif
+     /* V335: guarded pilot-throttle attitude mixer.  Neither SBUS transport
+      * nor this code proves RF is present when MC7RE repeats old channels. */
+     if (!dshot_send_all(output_dshot)) {
+@@ -1259,7 +1304,9 @@
+     if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+ 
+     boot_ms = HAL_GetTick(); sbus_service_receive_restart();
+-    log_async("FLIGHT_CANDIDATE: ARM_ENABLE=%u ARM_LOCK=%u SCAN=%u ALT_HOLD=%u IMU=%u CAL=%u\r\n",
++    log_async("YAW_R3: DIAG_LOCK=%u GYRO_FS=2000dps YSIGN=%ld ARM_ENABLE=%u ARM_LOCK=%u SCAN=%u ALT_HOLD=%u IMU=%u CAL=%u\r\n",
++              (unsigned)UAV_YAW_DIAGNOSTIC_ARM_LOCK,
++              (long)UAV_BODY_YAW_SENSOR_SIGN,
+               (unsigned)UAV_EXPERIMENTAL_ARM_ENABLE,
+               (unsigned)UAV_BENCH_ARM_LOCK,
+               (unsigned)UAV_PROPS_OFF_ESC_TEST,
+--- a/tests/test_flight.c
++++ b/tests/test_flight.c
+@@ -5,6 +5,9 @@
+ #include "../Core/Src/uav_test.c"
+ static uint32_t tick;
+ static HAL_StatusTypeDef spi_result=HAL_OK;
++static uint8_t mock_mpu_reg=0u;
++static uint8_t mock_mpu_gyro_cfg=0u;
++static bool mock_ignore_gyro_cfg_write=false;
+ static TIM_TypeDef timer;
+ UART_HandleTypeDef huart1,hlpuart1,huart3;
+ TIM_HandleTypeDef htim3={&timer};
+@@ -27,8 +30,19 @@
+ uint32_t HAL_GetTick(void){return tick;}
+ void HAL_Delay(uint32_t x){tick+=x;}
+ void HAL_GPIO_WritePin(int p,int n,int v){(void)p;(void)n;(void)v;}
+-HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef*h,uint8_t*p,uint16_t n,uint32_t t){(void)h;(void)p;(void)n;(void)t;return spi_result;}
+-HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef*h,uint8_t*a,uint8_t*b,uint16_t n,uint32_t t){(void)h;(void)a;(void)t;memset(b,0,n);if(n==14)b[4]=0x20;return spi_result;}
++HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef*h,uint8_t*p,uint16_t n,uint32_t t){
++ (void)h;(void)t;
++ if(n==1) mock_mpu_reg=(uint8_t)(p[0]&0x7fu);
++ else if(n==2 && p[0]==0x1bu && !mock_ignore_gyro_cfg_write) mock_mpu_gyro_cfg=p[1];
++ return spi_result;
++}
++HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef*h,uint8_t*a,uint8_t*b,uint16_t n,uint32_t t){
++ (void)h;(void)a;(void)t;memset(b,0,n);
++ if(n==14)b[4]=0x20;
++ if(n==1 && mock_mpu_reg==0x75u)b[0]=0x70u;
++ if(n==1 && mock_mpu_reg==0x1bu)b[0]=mock_mpu_gyro_cfg;
++ return spi_result;
++}
+ HAL_StatusTypeDef HAL_UART_Transmit_IT(UART_HandleTypeDef*h,uint8_t*p,uint16_t n){(void)h;(void)p;(void)n;return HAL_OK;}
+ HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_IT(UART_HandleTypeDef*h,uint8_t*p,uint16_t n){(void)h;(void)p;(void)n;return HAL_OK;}
+ int HAL_DMA_GetState(DMA_HandleTypeDef*h){(void)h;return HAL_DMA_STATE_READY;}
+@@ -304,7 +318,45 @@
+  assert(fabsf(state.rate_set_dps[1])<0.001f);
+  puts("PASS yaw-coupled Euler-target to body-rate mapping and level regression");
+ }
++static void test_gyro_2000dps_fsr_and_yaw_mapping(void) {
++ assert(MPU_GYRO_CONFIG_2000DPS == 0x18u);
++ assert(mpu6500_init_spi());
++ assert(mock_mpu_gyro_cfg == 0x18u);
++ mock_mpu_gyro_cfg=0x08u;
++ mock_ignore_gyro_cfg_write=true;
++ assert(!mpu6500_init_spi()); /* rejected stale hardware FSR */
++ mock_ignore_gyro_cfg_write=false;
++ assert(mpu6500_init_spi());
++ assert(GYRO_LSB_PER_DPS > 16.3f && GYRO_LSB_PER_DPS < 16.5f);
++ assert(GYRO_CAL_STILLNESS_MAX_DPS == 4.0f);
++ mock_ignore_gyro_cfg_write=false;mock_mpu_gyro_cfg=0x08u;
++ assert(mpu6500_init_spi()); /* Valid WHO_AM_I and readback after write. */
++ assert((mock_mpu_gyro_cfg & 0x18u)==0x18u);
++ mock_ignore_gyro_cfg_write=true;mock_mpu_gyro_cfg=0x08u;
++ assert(!mpu6500_init_spi()); /* Configuration mismatch must refuse IMU. */
++ mock_ignore_gyro_cfg_write=false;
++ gyro_bias_z_raw=0;
++ gyro_z=(int16_t)(-1000.0f*GYRO_LSB_PER_DPS);
++ assert(fabsf(body_yaw_rate_dps()-1000.0f) < 0.2f);
++ gyro_z=(int16_t)(+1000.0f*GYRO_LSB_PER_DPS);
++ assert(fabsf(body_yaw_rate_dps()+1000.0f) < 0.2f);
++ gyro_z=0;
++ puts("PASS MPU6500 +/-2000dps register/scale and nominal yaw sign conversion");
++}
+ int main(void){
++ test_gyro_2000dps_fsr_and_yaw_mapping();
++#if UAV_YAW_DIAGNOSTIC_ARM_LOCK
++ setup();step();sbus_channels[CH_ARM]=1800;sbus_channels[CH_THR]=800;
++ for(int i=0;i<100;i++)step();
++ assert(!armed && !spinning);zero();
++ assert((debug_arm_blockers & 0x2000u) != 0u);
++ puts("PASS diagnostic lock prevents arming and all motor output, independent of RC");
++#else
+  test_yaw_coupled_attitude(); test_yaw_coupled_rate_setpoints();
+  test_rate_integral_near_level(); test_rate_saturation_and_derivative_dt();
+- test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_acceleration_rejection();test_mixer();return 0;}
++ test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();
++ test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();
++ test_filter();test_acceleration_rejection();test_mixer();
++#endif
++ return 0;
++}
+--- a/tests/run_tests.sh
++++ b/tests/run_tests.sh
+@@ -3,14 +3,22 @@
+ cd "$(dirname "$0")/.."
+ test_bin=$(mktemp)
+ trap 'rm -f "$test_bin"' EXIT
+-cc -std=c11 -O1 -g -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter \
++# Default R3 build: propulsion is locked while yaw orientation is unverified.
++cc -std=c11 -O2 -g -Wall -Wextra -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter \
+   -fsanitize=undefined -fno-sanitize-recover=all -Itests/mocks -ICore/Inc \
+   tests/test_flight.c Core/Src/flight_pid.c Core/Src/rc_input.c -lm -o "$test_bin"
++"$test_bin"
++# Regression test previously flying R2 control logic with diagnostic lock
++# compiled OUT only in the host-side simulator; this does not change firmware.
++cc -std=c11 -O2 -g -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter \
++  -DUAV_YAW_DIAGNOSTIC_ARM_LOCK=0 -fsanitize=undefined -fno-sanitize-recover=all \
++  -Itests/mocks -ICore/Inc tests/test_flight.c Core/Src/flight_pid.c \
++  Core/Src/rc_input.c -lm -o "$test_bin"
+ "$test_bin"
+ python3 tests/test_protocol.py
+ 
+ config_test_bin=$(mktemp)
+ trap 'rm -f "$test_bin" "$config_test_bin"' EXIT
+-cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all \
++cc -std=c11 -O2 -g -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all \
+   -ICore/Inc tests/test_config_gate.c -o "$config_test_bin"
+ "$config_test_bin"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UAV live telemetry dashboard (offline, stdlib only).
+"""UAV live telemetry + buffered high-rate PID blackbox (offline, stdlib only).
 
 Receives the unchanged 88-byte STM32 telemetry protocol over UDP 14550,
 uses the existing project's exact decoder, records every good frame to CSV,
@@ -22,11 +22,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from uav_ground_station import decode_frame
+from uav_blackbox_decoder import decode_diag, DIAG_FIELDS
+from uav_imu_raw_decoder import decode_imu, IMU_FIELDS
 
 HELLO = b'UAVT_HELLO'
 CSV_FIELDS = [
     'received_at_utc', 'rx_elapsed_s', 'seq_gap_since_previous',
-    'seq', 'timestamp_ms', 'flags',
+    'seq', 'timestamp_ms', 'flags', 'cage_latched', 'cage_fault_code', 'cage_fault',
     'link_ok', 'failsafe', 'armed', 'spinning', 'imu_fresh', 'kill_active',
     'alt_hold', 'imu_calibrated', 'range_valid', 'dma_error', 'output_active', 'config_ready',
     'rc_throttle', 'rc_roll', 'rc_pitch', 'rc_yaw', 'roll_deg', 'pitch_deg',
@@ -55,6 +57,14 @@ class Collector:
         self.ip = ip
         self.port = port
         self.csv_path = csv_path
+        self.diag_path = csv_path.with_name(csv_path.stem + '_PID200.csv')
+        self.imu_path = csv_path.with_name(csv_path.stem + '_IMU1000.csv')
+        self.imu_packets = 0
+        self.diag_packets = 0
+        self.last_diag_rx_t = None
+        self.diag_capture = None
+        self.diag_history = deque(maxlen=512)
+        self.diag_indices = set()
         self.started = time.monotonic()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -79,9 +89,19 @@ class Collector:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(('0.0.0.0', self.port))
             sock.settimeout(0.15)
-            with self.csv_path.open('w', encoding='utf-8', newline='', buffering=1) as fp:
+            with self.csv_path.open('w', encoding='utf-8', newline='', buffering=1) as fp, \
+                 self.diag_path.open('w', encoding='utf-8', newline='', buffering=1) as diagfp, \
+                 self.imu_path.open('w', encoding='utf-8', newline='', buffering=1) as imufp:
                 writer = csv.DictWriter(fp, fieldnames=CSV_FIELDS, extrasaction='ignore')
                 writer.writeheader()
+                diagwriter = csv.DictWriter(diagfp, fieldnames=DIAG_FIELDS, extrasaction='ignore')
+                diagwriter.writeheader()
+                imuwriter = csv.DictWriter(imufp, fieldnames=IMU_FIELDS, extrasaction='ignore')
+                imuwriter.writeheader()
+                imu_capture = None
+                imu_last_cycle = None
+                imu_last_idx = None
+                imu_relative_us = 0.0
                 flush_at = time.monotonic()
                 while not self.stop_event.is_set():
                     now = time.monotonic()
@@ -107,6 +127,52 @@ class Collector:
                             continue  # local loopback HELLO is not a telemetry error
                         # Avoid mixing in packets from other sources.
                         if addr and addr[0] != self.ip:
+                            continue
+                        if len(raw) == 88 and raw[:4] == b'\xa5\x5a\x01\x03':
+                            row_imu = decode_imu(raw)
+                            if row_imu is None:
+                                with self.lock: self.invalid += 1
+                            else:
+                                cid = row_imu['capture_id']
+                                idx = row_imu['capture_index']
+                                if imu_capture != cid or idx == 0:
+                                    imu_capture, imu_last_cycle, imu_last_idx = cid, None, None
+                                    imu_relative_us = 0.0
+                                if imu_last_cycle is not None and idx > imu_last_idx:
+                                    delta = ((row_imu['cycle_count'] - imu_last_cycle) & 0xffffffff)
+                                    imu_relative_us += delta / row_imu['hclk_mhz']
+                                    row_imu['sample_gap'] = idx - imu_last_idx - 1
+                                row_imu['relative_us'] = round(imu_relative_us, 2)
+                                imu_last_cycle = row_imu['cycle_count']
+                                imu_last_idx = idx
+                                row_imu['received_at_utc'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                                imuwriter.writerow(row_imu)
+                                with self.lock: self.imu_packets += 1
+                            continue
+                        if len(raw) == 88 and raw[:4] == b'\xa5\x5a\x01\x02':
+                            row_diag = decode_diag(raw)
+                            if row_diag is None:
+                                with self.lock:
+                                    self.invalid += 1
+                            else:
+                                row_diag['received_at_utc'] = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+                                diagwriter.writerow(row_diag)
+                                with self.lock:
+                                    if self.diag_capture != row_diag['capture_id']:
+                                        self.diag_history.clear()
+                                        self.diag_capture = row_diag['capture_id']
+                                        self.diag_indices.clear()
+                                    self.diag_packets += 1
+                                    self.last_diag_rx_t = time.monotonic()
+                                    self.diag_indices.add(row_diag['capture_index'])
+                                    self.diag_history.append({
+                                        't': row_diag['stamp_ms'] / 1000.0,
+                                        'gyro_yaw_dps': row_diag['gyro_yaw_dps'],
+                                        'rate_set_yaw_dps': row_diag['rate_set_yaw_dps'],
+                                        'yaw_p': row_diag['yaw_p'],
+                                        'yaw_i': row_diag['yaw_i'],
+                                        'yaw_d': row_diag['yaw_d'],
+                                    })
                             continue
                         row = decode_frame(raw)
                         now = time.monotonic()
@@ -143,6 +209,8 @@ class Collector:
                                 **row,
                             })
                     if time.monotonic() - flush_at >= 1.0:
+                        diagfp.flush()
+                        imufp.flush()
                         fp.flush()
                         flush_at = time.monotonic()
         except OSError as exc:
@@ -159,9 +227,10 @@ class Collector:
             while self.rx_times and self.rx_times[0] < now - 5.0:
                 self.rx_times.popleft()
             hz = round(len(self.rx_times)/min(5.0, max(now - self.started, 0.1)), 1)
+            replay = self.last_diag_rx_t is not None and now - self.last_diag_rx_t < 1.5
             return {
-                'mode': 'LIVE',
-                'status': 'WAITING' if age is None else ('STALE' if age > 1.5 else 'LIVE'),
+                'mode': 'REPLAY' if replay else 'LIVE',
+                'status': 'REPLAY' if replay else ('WAITING' if age is None else ('STALE' if age > 1.5 else 'LIVE')), 
                 'age_s': age,
                 'ip': self.ip, 'port': self.port,
                 'packets': self.packets, 'invalid': self.invalid,
@@ -172,6 +241,13 @@ class Collector:
                 'last': self.last_data,
                 'history': list(self.samples),
                 'csv_path': str(self.csv_path.resolve()),
+                'pid_csv_path': str(self.diag_path.resolve()),
+                'imu_csv_path': str(self.imu_path.resolve()),
+                'imu_frames': self.imu_packets,
+                'pid_frames': self.diag_packets,
+                'pid_capture': self.diag_capture,
+                'pid_distinct_samples': len(self.diag_indices),
+                'pid_history': list(self.diag_history),
                 'notes': {
                     'dps310': 'NOT_IN_V1_FRAME',
                     'battery': 'NOT_MEASURED_UNLESS_FIELD_PRESENT',
@@ -208,6 +284,10 @@ h1{font-size:20px;margin:0}h2{font-size:15px;margin:0 0 10px}small,.muted{color:
 <div class="row"><div class="card"><h2>05 · PID correction (không phải Kp/Ki/Kd)</h2><div class="chart"><canvas id="pid"></canvas></div><div class="legend" id="pid-legend"></div></div><div class="card"><h2>06 · ESC DShot output M1–M4</h2><div class="chart"><canvas id="motor"></canvas></div><div class="legend" id="motor-legend"></div></div></div>
 <div class="row"><div class="card"><h2>07 · MT-06 khoảng cách thẳng đứng (cm)</h2><div class="chart"><canvas id="range"></canvas></div><div class="legend" id="range-legend"></div></div><div class="card"><h2>08 · Ghi nhận chất lượng liên kết</h2><div class="card" style="border:0;background:#0e1b2c"><div class="info" id="link-detail" style="grid-template-columns:repeat(2,minmax(0,1fr))"></div><small>Sequence gap không chứng minh riêng mất gói Wi-Fi: STM32 cũng bỏ lượt gửi khi UART bận. Rate 5 giây là tốc độ gói laptop thực nhận, không phải độ trễ điều khiển.</small></div><h2 style="margin-top:14px">DPS310 & nguồn</h2><p class="muted">DPS310 đã có driver trên STM32 nhưng <strong>chưa truyền</strong> áp suất/nhiệt độ/độ cao trong frame v1. Điện áp và dòng pin hiện <strong>chưa đo</strong> (giá trị 0xFFFF) nếu không lắp thêm cảm biến. Dashboard không tự tạo số liệu.</p></div></div>
 <div class="alert">Chỉ theo dõi và ghi log. Dashboard này không ARM, không thay PID, không điều khiển motor. Không dựa vào Wi-Fi/biểu đồ để điều khiển bay hoặc thay thế failsafe RC. Kiểm tra an toàn trên bàn trước bất kỳ thử nghiệm nào.</div>
+<div class="card" style="margin:14px 0"><h2>09 · Blackbox PID 200 Hz (mẫu đã ghi trong RAM STM32)</h2>
+<small>Dữ liệu được phát lại sau khi ghi, KHÔNG phải biểu đồ phản hồi bay thời gian thực. Firmware chẩn đoán khóa ARM.</small>
+<div class="chart"><canvas id="blackbox"></canvas></div><div class="legend" id="blackbox-legend"></div>
+<p id="pid-file-path" class="muted">Chưa nhận mẫu PID 200 Hz</p></div>
 <footer id="file-path">CSV đang ghi trên laptop…</footer>
 </main>
 <script>
@@ -219,6 +299,7 @@ const groups={
  pid:[['pid_roll','Roll corr.','#68caff'],['pid_pitch','Pitch corr.','#f1b56c'],['pid_yaw','Yaw corr.','#af92ff']],
  motor:[['out_m1','M1','#68caff'],['out_m2','M2','#f3b96d'],['out_m3','M3','#8ee3a0'],['out_m4','M4','#b29aff']],
  range:[['range_cm','MT-06 range','#8ee3a0']],
+ blackbox:[['gyro_yaw_dps','Yaw gyro','#af92ff'],['rate_set_yaw_dps','Yaw setpoint','#68caff']],
 };
 for(const [id,fields] of Object.entries(groups)){document.getElementById(id+'-legend').innerHTML=fields.map(([k,l,c])=>`<i style="background:${c}"></i>${l}`).join(' ')}
 const val=(v,d=1)=>v===null||v===undefined?'—':typeof v==='number'?Number(v).toFixed(d):String(v);
@@ -256,11 +337,11 @@ document.getElementById('window').addEventListener('change',e=>win=Number(e.targ
 async function update(){
  try{
   let r=await fetch('/api/snapshot',{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);let s=await r.json();history=s.history||[];
-  const status=document.getElementById('connection');status.className='pill '+(s.status==='LIVE'?'live':s.status==='STALE'?'stale':'waiting');status.textContent=s.status==='LIVE'?'● ĐANG NHẬN':s.status==='STALE'?'● MẤT TELEMETRY':'● CHỜ TELEMETRY';
+  const status=document.getElementById('connection');status.className='pill '+(s.status==='LIVE'?'live':s.status==='REPLAY'?'waiting':s.status==='STALE'?'stale':'waiting');status.textContent=s.status==='LIVE'?'● ĐANG NHẬN':s.status==='REPLAY'?'● ĐANG TẢI PID 200HZ':s.status==='STALE'?'● MẤT TELEMETRY':'● CHỜ TELEMETRY';
   for(let [id,text] of Object.entries({packets:s.packets.toLocaleString('vi-VN'),rate:s.receive_hz_5s+' Hz',age:s.age_s===null?'—':s.age_s+' s',gaps:s.seq_gap.toLocaleString('vi-VN'),invalid:s.invalid.toLocaleString('vi-VN')}))document.getElementById(id).textContent=text;
   let d=s.last||{};document.getElementById('time').textContent=d.timestamp_ms===undefined?'':'· STM32 t = '+d.timestamp_ms+' ms';
   document.getElementById('flight').textContent=s.status!=='LIVE'?'—':d.failsafe?'FAILSAFE':d.armed?'ARMED':'DISARM';
-  document.getElementById('flight-sub').textContent='KILL: '+(d.kill_active?'ON':'OFF')+' · Link: '+(d.link_ok?'OK':'NO')+' · IMU: '+(d.imu_fresh?'FRESH':'STALE');
+  document.getElementById('flight-sub').textContent='KILL: '+(d.kill_active?'ON':'OFF')+' · Link: '+(d.link_ok?'OK':'NO')+' · IMU: '+(d.imu_fresh?'FRESH':'STALE')+' · CAGE: '+(d.cage_latched?'KHÓA / ':'')+(d.cage_fault||'—');
   document.getElementById('latest').innerHTML=[
    box('Roll / Pitch',val(d.roll_deg,2)+'° / '+val(d.pitch_deg,2)+'°'),
    box('Gyro XYZ (°/s)',[d.gyro_roll_dps,d.gyro_pitch_dps,d.gyro_yaw_dps].map(v=>val(v)).join(' / ')),
@@ -273,10 +354,19 @@ async function update(){
   ].join('');
   document.getElementById('link-detail').innerHTML=box('Sequence gaps (lũy kế)',s.seq_gap.toLocaleString())+box('Invalid packets',s.invalid)+box('Đảo thứ tự / trùng seq',s.out_of_order)+box('Lỗi HELLO',s.hello_errors)+box('Uptime',s.uptime_s+' s')+box('Hệ thống',s.status);
   document.getElementById('file-path').textContent='CSV ghi trên laptop: '+s.csv_path+(s.error?' · Lỗi: '+s.error:'');
-  for(const id of Object.keys(groups))drawChart(id,history,win);
+  let pid=s.pid_history||[];
+  if(pid.length){
+    const start=pid[0].t;
+    const offset=pid.map(x=>({...x,t:x.t-start}));
+    drawChart('blackbox',offset,Math.max(4,(offset[offset.length-1].t||0)+0.5));
+  } else drawChart('blackbox',[],15);
+  document.getElementById('pid-file-path').textContent =
+    'Mẫu Blackbox: '+(s.pid_distinct_samples||0)+' · Capture #'+(s.pid_capture??'—')+
+    ' · CSV: '+(s.pid_csv_path||'—');
+  for(const id of Object.keys(groups).filter(x=>x!=='blackbox'))drawChart(id,history,win);
  }catch(e){document.getElementById('connection').textContent='LỖI WEB: '+e.message;document.getElementById('connection').className='pill stale';}
 }
-update();setInterval(update,800);window.addEventListener('resize',()=>{for(let id of Object.keys(groups))drawChart(id,history,win)});
+update();setInterval(update,800);window.addEventListener('resize',()=>{for(let id of Object.keys(groups).filter(x=>x!=='blackbox'))drawChart(id,history,win)});
 </script></body></html>'''
 
 

@@ -3,8 +3,14 @@
 #include <assert.h>
 #include <stdlib.h>
 #include "../Core/Src/uav_test.c"
+CoreDebug_Type mock_coredebug;
+DWT_Type mock_dwt;
+uint32_t HAL_RCC_GetHCLKFreq(void) { return 170000000u; }
 static uint32_t tick;
 static HAL_StatusTypeDef spi_result=HAL_OK;
+static uint8_t mock_mpu_reg=0u;
+static uint8_t mock_mpu_gyro_cfg=0u;
+static bool mock_ignore_gyro_cfg_write=false;
 static TIM_TypeDef timer;
 UART_HandleTypeDef huart1,hlpuart1,huart3;
 TIM_HandleTypeDef htim3={&timer};
@@ -13,6 +19,13 @@ DMA_HandleTypeDef hdma_tim3_up;
 I2C_HandleTypeDef hi2c1;
 /* UART bridge mocks: independent protocol module is tested separately. */
 void UAVTelemetry_Reset(void) {}
+bool UAVTelemetry_SendBlackbox(UART_HandleTypeDef *u, const UAVRateSample *s, uint16_t i, uint16_t n, uint16_t c) {
+    (void)u; (void)s; (void)i; (void)n; (void)c; return true;
+}
+bool UAVTelemetry_SendIMURaw(UART_HandleTypeDef *u, const UAVIMURawSample *s,
+                             uint16_t i, uint16_t n, uint16_t c, uint16_t k, uint16_t mhz) {
+ (void)u; (void)s; (void)i; (void)n; (void)c; (void)k; (void)mhz; return true;
+}
 bool UAVTelemetry_Send(UART_HandleTypeDef *u, const UAVTelemetrySample *s) {(void)u;(void)s;return true;}
 void UAVTelemetry_OnTxComplete(UART_HandleTypeDef *u) {(void)u;}
 bool UAVTelemetry_OnTxError(UART_HandleTypeDef *u) {(void)u;return false;}
@@ -24,11 +37,29 @@ void UAVConfig_OnTxComplete(UART_HandleTypeDef *u) {(void)u;}
 void UAVConfig_OnError(UART_HandleTypeDef *u) {(void)u;}
 void UAVConfig_Service(bool safe) {(void)safe;}
 void UAVConfig_ServiceBoot(bool safe) {(void)safe;}
+/* Reference-pose config mocks (covered independently by config unit tests). */
+float UAVConfig_LevelRoll(void) { return 0.0f; }
+float UAVConfig_LevelPitch(void) { return 0.0f; }
+void UAVConfig_LevelGet(float *r, float *p, bool *valid) { if(r)*r=0; if(p)*p=0; if(valid)*valid=false; }
+void UAVConfig_LevelObserve(float r, float p, float gr, float gp, float gy, float conf, bool safe)
+{ (void)r; (void)p; (void)gr; (void)gp; (void)gy; (void)conf; (void)safe; }
+
 uint32_t HAL_GetTick(void){return tick;}
 void HAL_Delay(uint32_t x){tick+=x;}
 void HAL_GPIO_WritePin(int p,int n,int v){(void)p;(void)n;(void)v;}
-HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef*h,uint8_t*p,uint16_t n,uint32_t t){(void)h;(void)p;(void)n;(void)t;return spi_result;}
-HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef*h,uint8_t*a,uint8_t*b,uint16_t n,uint32_t t){(void)h;(void)a;(void)t;memset(b,0,n);if(n==14)b[4]=0x20;return spi_result;}
+HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef*h,uint8_t*p,uint16_t n,uint32_t t){
+ (void)h;(void)t;
+ if(n==1) mock_mpu_reg=(uint8_t)(p[0]&0x7fu);
+ else if(n==2 && p[0]==0x1bu && !mock_ignore_gyro_cfg_write) mock_mpu_gyro_cfg=p[1];
+ return spi_result;
+}
+HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef*h,uint8_t*a,uint8_t*b,uint16_t n,uint32_t t){
+ (void)h;(void)a;(void)t;memset(b,0,n);
+ if(n==14)b[4]=0x20;
+ if(n==1 && mock_mpu_reg==0x75u)b[0]=0x70u;
+ if(n==1 && mock_mpu_reg==0x1bu)b[0]=mock_mpu_gyro_cfg;
+ return spi_result;
+}
 HAL_StatusTypeDef HAL_UART_Transmit_IT(UART_HandleTypeDef*h,uint8_t*p,uint16_t n){(void)h;(void)p;(void)n;return HAL_OK;}
 HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_IT(UART_HandleTypeDef*h,uint8_t*p,uint16_t n){(void)h;(void)p;(void)n;return HAL_OK;}
 int HAL_DMA_GetState(DMA_HandleTypeDef*h){(void)h;return HAL_DMA_STATE_READY;}
@@ -46,6 +77,8 @@ void MT06_ErrorCallback(UART_HandleTypeDef*h){(void)h;}
 bool MT06_GetData(const MT06_HandleTypeDef*d,MT06_Data*b){(void)d;memset(b,0,sizeof(*b));return false;}
 static void setup(void){
  tick=10000;boot_ms=0;armed=false;spinning=false;arm_ready=false;arm_switch_prev=false;
+ UAVCage_Init(&cage_guard);bb_spinning_since=0u;bb_prev_cage_powered=false;
+ UAVConfigGate_Reset(&uav_config_gate);uav_config_allowed=false;
  imu_ready=imu_calibrated=imu_control_valid=attitude_initialized=true;
  roll_angle=pitch_angle=0;gyro_x=gyro_y=gyro_z=0;
  gyro_bias_x_raw=gyro_bias_y_raw=gyro_bias_z_raw=0;
@@ -134,16 +167,21 @@ static void test_protocol(void){
  puts("PASS all DShot payloads/CRC, SBUS 16-channel decode, RC neutral/low throttle");
 }
 static void test_config_mode(void){
- setup();sbus_channels[CH_CONFIG]=1800;sbus_channels[CH_KILL]=1800;step();
- assert(uav_config_allowed && !armed && !spinning);
+ /* No CH8 on the MC6C. CH5 ARM, CH6 KILL are the only safety switches. */
+ setup();sbus_channels[CH_CONFIG]=1000;sbus_channels[CH_KILL]=1800;step();
+ assert(!uav_config_allowed && !armed && !spinning); /* safe hold begins */
+ tick+=2000;step();assert(uav_config_allowed);
+ sbus_channels[CH_CONFIG]=1800;step();assert(uav_config_allowed); /* CH8 ignored in six-channel mode */
  sbus_channels[CH_KILL]=1000;step();assert(!uav_config_allowed);
- sbus_channels[CH_KILL]=1800;sbus_channels[CH_ARM]=1800;step();
- assert(!uav_config_allowed && !armed);
- sbus_channels[CH_ARM]=1000;step();assert(uav_config_allowed);
- sbus_channels[CH_CONFIG]=1000;step();assert(!uav_config_allowed);
+ sbus_channels[CH_KILL]=1800;step();assert(!uav_config_allowed); /* 2s restart */
+ tick+=2000;step();assert(uav_config_allowed);
+ sbus_channels[CH_ARM]=1800;step();assert(!uav_config_allowed && !armed);
+ sbus_channels[CH_ARM]=1000;step();assert(!uav_config_allowed);
+ tick+=2000;step();assert(uav_config_allowed);
+ sbus_channels[CH_THR]=800;step();assert(!uav_config_allowed);
  setup();step();sbus_channels[CH_ARM]=1800;step();assert(armed);
  sbus_channels[CH_CONFIG]=1800;step();assert(armed && !uav_config_allowed); /* no midflight disarm */
- puts("PASS physical CH8 config gate, ARM lock, no midflight CH8 disarm");
+ puts("PASS six-channel PID config gate with 2s hold, safety locks and normal ARM");
 }
 static void test_20261105_ground_log_zero(void) {
  /* Known-level hypothesis from 2,283 stationary samples. Account for the
@@ -210,13 +248,17 @@ static void test_rate_integral_near_level(void){
  assert(fabsf(state.pid_i[0]+6.0f)<0.001f);
  assert(fabsf(state.rate_set_dps[0]+6.0f)<0.001f);
  assert(fabsf(state.rate_error_dps[0]+6.0f)<0.001f);
- /* Disarmed/actively maneuvering gate revokes integrator immediately. */
+ /* Fast transient must freeze the bias instead of deleting it. */
  in.allow_integrator=false; assert(FlightPID_Step(&state,&in,&o));
+ assert(state.integrator[0] < -29.9f && fabsf(state.pid_i[0]+6.0f)<0.01f);
+ /* Motor-off condition explicitly resets the stored correction. */
+ in.reset_integrator=true; assert(FlightPID_Step(&state,&in,&o));
  assert(state.integrator[0]==0.0f && state.pid_i[0]==0.0f);
+ in.reset_integrator=false;
  in.allow_integrator=true; in.roll_deg=0.0f;
  FlightPID_Reset(&state); assert(FlightPID_Step(&state,&in,&o));
  assert(fabsf(o.roll)<0.001f);
- puts("PASS tiny bounded near-level I, setpoint/error telemetry and gate reset");
+ puts("PASS tiny bounded near-level I, setpoint/error telemetry, freeze and motor-off reset");
 }
 static void test_rate_saturation_and_derivative_dt(void){
  FlightPIDGains baseline,g; FlightPID_DefaultGains(&baseline);
@@ -250,6 +292,136 @@ static void test_rate_saturation_and_derivative_dt(void){
  assert(FlightPID_SetGains(&baseline));
  puts("PASS saturation antiwindup and dt-invariant D lowpass");
 }
+
+static void test_yaw_coupled_attitude(void){
+ /* At 10 deg roll and 8 deg pitch, a +120 dps BODY yaw causes nonzero
+  * Euler roll/pitch rate even when body p/q are zero.  Refuse gravity
+  * correction for this synthetic sample; integrate exactly one 10ms tick. */
+ const float rad=0.01745329251994329577f;
+ const float initial_roll=10.0f, initial_pitch=8.0f, yaw=120.0f;
+ accel_x=0;accel_y=0;accel_z=15000; /* |a|>1.3g -> reject accel */
+ gyro_bias_x_raw=gyro_bias_y_raw=gyro_bias_z_raw=0;
+ gyro_x=gyro_y=0;gyro_z=(int16_t)(-yaw*GYRO_LSB_PER_DPS);
+ attitude_initialized=true;
+ sensor_pitch_angle=IMU_PITCH_MOUNT_TRIM_DEG-initial_roll;
+ sensor_roll_angle=IMU_ROLL_MOUNT_TRIM_DEG-initial_pitch;
+ const float expected_roll=initial_roll + yaw*cosf(initial_roll*rad)*tanf(initial_pitch*rad)*0.010f;
+ const float expected_pitch=initial_pitch - yaw*sinf(initial_roll*rad)*0.010f;
+ update_attitude(10);
+ assert(fabsf(roll_angle-expected_roll)<0.001f);
+ assert(fabsf(pitch_angle-expected_pitch)<0.001f);
+ assert(fabsf(sensor_pitch_angle-(IMU_PITCH_MOUNT_TRIM_DEG-roll_angle))<0.0001f);
+ assert(fabsf(sensor_roll_angle-(IMU_ROLL_MOUNT_TRIM_DEG-pitch_angle))<0.0001f);
+ puts("PASS yaw-coupled 3D attitude propagation and legacy sensor-axis mapping");
+}
+static void test_yaw_coupled_rate_setpoints(void){
+ FlightPIDGains baseline;FlightPID_DefaultGains(&baseline);
+ assert(FlightPID_SetGains(&baseline));
+ FlightPIDState state={0};FlightPIDInput in={0};FlightPIDOutput out={0};
+ in.dt_s=0.001f;in.roll_deg=10.0f;in.pitch_deg=8.0f;in.gyro_yaw_dps=120.0f;
+ assert(FlightPID_Step(&state,&in,&out));
+ const float phi=in.roll_deg*0.01745329251994329577f;
+ const float theta=in.pitch_deg*0.01745329251994329577f;
+ const float phi_dot=-baseline.angle_kp*in.roll_deg;
+ const float theta_dot=-baseline.angle_kp*in.pitch_deg;
+ const float q=(theta_dot+in.gyro_yaw_dps*sinf(phi))/cosf(phi);
+ const float p=phi_dot-(q*sinf(phi)+in.gyro_yaw_dps*cosf(phi))*tanf(theta);
+ assert(fabsf(state.rate_set_dps[0]-p)<0.01f);
+ assert(fabsf(state.rate_set_dps[1]-q)<0.01f);
+ assert(fabsf(state.rate_set_dps[2])<0.01f);
+ /* With zero yaw and a level airframe, retain legacy rate setpoints. */
+ in.roll_deg=0;in.pitch_deg=0;in.gyro_yaw_dps=0;
+ assert(FlightPID_Step(&state,&in,&out));
+ assert(fabsf(state.rate_set_dps[0])<0.001f);
+ assert(fabsf(state.rate_set_dps[1])<0.001f);
+ puts("PASS yaw-coupled Euler-target to body-rate mapping and level regression");
+}
+static void test_gyro_2000dps_fsr_and_yaw_mapping(void) {
+ assert(MPU_GYRO_CONFIG_2000DPS == 0x18u);
+ assert(mpu6500_init_spi());
+ assert(mock_mpu_gyro_cfg == 0x18u);
+ mock_mpu_gyro_cfg=0x08u;
+ mock_ignore_gyro_cfg_write=true;
+ assert(!mpu6500_init_spi()); /* rejected stale hardware FSR */
+ mock_ignore_gyro_cfg_write=false;
+ assert(mpu6500_init_spi());
+ assert(GYRO_LSB_PER_DPS > 16.3f && GYRO_LSB_PER_DPS < 16.5f);
+ assert(GYRO_CAL_STILLNESS_MAX_DPS == 4.0f);
+ mock_ignore_gyro_cfg_write=false;mock_mpu_gyro_cfg=0x08u;
+ assert(mpu6500_init_spi()); /* Valid WHO_AM_I and readback after write. */
+ assert((mock_mpu_gyro_cfg & 0x18u)==0x18u);
+ mock_ignore_gyro_cfg_write=true;mock_mpu_gyro_cfg=0x08u;
+ assert(!mpu6500_init_spi()); /* Configuration mismatch must refuse IMU. */
+ mock_ignore_gyro_cfg_write=false;
+ gyro_bias_z_raw=0;
+ gyro_z=(int16_t)(-1000.0f*GYRO_LSB_PER_DPS);
+ assert(fabsf(body_yaw_rate_dps()-1000.0f) < 0.2f);
+ gyro_z=(int16_t)(+1000.0f*GYRO_LSB_PER_DPS);
+ assert(fabsf(body_yaw_rate_dps()+1000.0f) < 0.2f);
+ gyro_z=0;
+ puts("PASS MPU6500 +/-2000dps register/scale and nominal yaw sign conversion");
+}
+#if UAV_CAGE_TEST_ARM_ENABLE
+static void test_r5_cage_motor_timeout_and_overspeed(void) {
+ arm_and_spin();
+ for (unsigned i=0; i<UAV_CAGE_MAX_ACTIVE_MS+20u && armed; i++) step();
+ assert(!armed && cage_guard.latched && cage_guard.fault==UAV_CAGE_TIMEOUT);zero();
+ sbus_channels[CH_ARM]=1000;step();sbus_channels[CH_ARM]=1800;step();
+ assert(!armed && (debug_arm_blockers & 0x4000u));zero();
+ arm_and_spin();
+ gyro_z=(int16_t)(-125.0f*GYRO_LSB_PER_DPS);
+ for(unsigned i=0;i<UAV_CAGE_SOFT_HOLD_MS+10u && armed;i++) step();
+ assert(!armed && cage_guard.latched && cage_guard.fault==UAV_CAGE_FAST_YAW);zero();
+ puts("PASS R5 motor command cutoff: timer / yaw limit and no repeated ARM");
+}
+static void test_r5_blackbox_short_powered_cutout(void) {
+ arm_and_spin();
+ UAVBB_Reset();bb_last_imu_seq=0u;bb_last_sample_ms=0u;
+ /* Turn throttle on, then KILL: capture should still trigger at motor-off edge
+  * even if no yaw excursion and test duration less than 1.2 s. */
+ for (int j=0;j<70;j++) {
+   for(int i=0;i<5;i++) step();
+   bb_record_if_due(tick,false);
+ }
+ assert(bb_prev_cage_powered);
+ sbus_channels[CH_KILL]=1800;step();
+ bb_record_if_due(tick,true);
+ assert(!armed && !spinning && cage_guard.latched);
+ for(int j=0;j<UAV_BB_POST_TRIGGER+3;j++) {
+   for(int i=0;i<5;i++) step();
+   bb_record_if_due(tick,true);
+ }
+ assert(UAVBB_Dumping());
+ UAVRateSample record;uint16_t i,n,id;bool powered=false,unpowered=false;
+ while(UAVBB_Peek(&record,&i,&n,&id)) {
+   if(record.flags&2u) powered=true;
+   if(!(record.motor[0]|record.motor[1]|record.motor[2]|record.motor[3])) unpowered=true;
+   UAVBB_Sent();
+ }
+ assert(powered && unpowered);
+ puts("PASS R5 motor-on DShot history, short run cutout, deferred captured dump");
+}
+#endif
 int main(void){
+ test_gyro_2000dps_fsr_and_yaw_mapping();
+#if UAV_YAW_DIAGNOSTIC_ARM_LOCK
+ setup();step();sbus_channels[CH_ARM]=1800;sbus_channels[CH_THR]=800;
+ for(int i=0;i<100;i++)step();
+ assert(!armed && !spinning);zero();
+ assert((debug_arm_blockers & 0x2000u) != 0u);
+ puts("PASS diagnostic lock prevents arming and all motor output, independent of RC");
+#else
+ test_yaw_coupled_attitude(); test_yaw_coupled_rate_setpoints();
  test_rate_integral_near_level(); test_rate_saturation_and_derivative_dt();
- test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_acceleration_rejection();test_mixer();return 0;}
+ test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();
+ test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();
+ test_filter();test_acceleration_rejection();test_mixer();
+ assert(UAV_EXPERIMENTAL_MAX_DSHOT == (UAV_CAGE_TEST_ARM_ENABLE ? 1550u : DSHOT_THROTTLE_MAX));
+ puts("PASS R5 captive motor ceiling and normal safety regression");
+#if UAV_CAGE_TEST_ARM_ENABLE
+ test_r5_cage_motor_timeout_and_overspeed();
+ test_r5_blackbox_short_powered_cutout();
+#endif
+#endif
+ return 0;
+}

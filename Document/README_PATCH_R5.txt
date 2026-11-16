@@ -1,0 +1,1 @@
+R5 CAPTIVE CAGE PATCH — Extract contents INTO YOUR EXISTING R4 PROJECT ROOT; backup project first. Requires matching R4 firmware ESP32 and R4 Ground Station type-2. Build and verify on props-off bench before any powered cage test. READ README_R5_CAGE_PID_BLACKBOX_VI.md. NOT FOR FREE FLIGHT.

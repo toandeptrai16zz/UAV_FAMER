@@ -1,5 +1,6 @@
 #include "uav_config.h"
 #include "flight_pid.h"
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -14,6 +15,11 @@
 #define GAINS_WIRE_SIZE 52u
 #define FLASH_CFG_MAGIC 0x55415650u
 #define FLASH_CFG_COMMIT UINT64_C(0xC0DEC0DEAA55AA55)
+#define LEVEL_TAIL_MAGIC 0x4C565231u /* LVR1 */
+#define LEVEL_TAIL_COMMIT UINT64_C(0x4C565243454E4431)
+#define LEVEL_MAX_TARE_DEG 5.0f
+#define LEVEL_SAMPLE_PERIOD_MS 20u
+#define LEVEL_SAMPLE_COUNT 100u /* 2 s of stationary airframe attitude */
 #define FLASH_CFG_PAGE0 0x0807F000u
 #define FLASH_CFG_PAGE1 0x0807F800u
 
@@ -28,6 +34,21 @@ typedef struct {
 _Static_assert(sizeof(FlightPIDGains) == GAINS_WIRE_SIZE, "Gain format must be 52 bytes");
 _Static_assert(offsetof(ConfigRecord, commit) == 64u, "Record layout changed");
 _Static_assert(sizeof(ConfigRecord) == 72u, "Flash doubleword layout changed");
+/* Backward-compatible extension at byte 72: R5.5 firmware can still read
+ * the legacy 72-byte PID portion. New code reads the tail only if valid.
+ * Save commits PID last, so partially written records never supersede old. */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    float roll_deg;
+    float pitch_deg;
+    uint32_t flags; /* 1 = captured, 0 = cleared */
+    uint32_t checksum;
+    uint64_t commit;
+} LevelTail;
+_Static_assert(sizeof(LevelTail) == 32u, "Level tail must align to FLASH doublewords");
+_Static_assert(offsetof(LevelTail, commit) == 24u, "Level tail commit alignment");
+
 
 static UART_HandleTypeDef *link_uart;
 static uint8_t uart_rx_byte;
@@ -41,6 +62,16 @@ static uint8_t tx_size;
 static volatile bool tx_active;
 static bool tx_pending;
 static uint32_t stored_generation;
+static float reference_roll_deg, reference_pitch_deg;
+static bool reference_valid;
+typedef struct { float roll, pitch; } LevelSample;
+static LevelSample level_samples[LEVEL_SAMPLE_COUNT];
+static uint16_t level_samples_count;
+static uint32_t level_last_observed_ms, level_last_sampled_ms;
+/* R5.6.1: status for the UI; does not change any capture/ARM gating. */
+static float level_live_roll = 0.0f, level_live_pitch = 0.0f;
+static uint8_t level_observe_reason = 1u; /* 0 stable, 1 gate, 2 invalid, 3 moving, 4 accel, 5 tilt, 6 gap, 7 filling */
+
 static bool boot_armed;
 static uint32_t boot_acked_at;
 
@@ -60,6 +91,93 @@ static uint32_t hash32(const uint8_t *bytes, uint32_t size)
     for (uint32_t i = 0; i < size; ++i) { hash ^= bytes[i]; hash *= 16777619u; }
     return hash;
 }
+static bool level_tail_valid(const LevelTail *tail)
+{
+    return tail->magic == LEVEL_TAIL_MAGIC && tail->version == 1u &&
+           tail->commit == LEVEL_TAIL_COMMIT && tail->flags <= 1u &&
+           isfinite(tail->roll_deg) && isfinite(tail->pitch_deg) &&
+           fabsf(tail->roll_deg) <= LEVEL_MAX_TARE_DEG &&
+           fabsf(tail->pitch_deg) <= LEVEL_MAX_TARE_DEG &&
+           hash32((const uint8_t *)tail, offsetof(LevelTail, checksum)) == tail->checksum;
+}
+static void level_from_record(const ConfigRecord *record)
+{
+    reference_roll_deg = reference_pitch_deg = 0.0f;
+    reference_valid = false;
+    if (!record) return;
+    const LevelTail *tail = (const LevelTail *)((const uint8_t *)record + sizeof(ConfigRecord));
+    if (level_tail_valid(tail) && tail->flags == 1u) {
+        reference_roll_deg = tail->roll_deg;
+        reference_pitch_deg = tail->pitch_deg;
+        reference_valid = true;
+    }
+}
+float UAVConfig_LevelRoll(void) { return reference_roll_deg; }
+float UAVConfig_LevelPitch(void) { return reference_pitch_deg; }
+void UAVConfig_LevelGet(float *roll, float *pitch, bool *valid)
+{
+    if (roll) *roll = reference_roll_deg;
+    if (pitch) *pitch = reference_pitch_deg;
+    if (valid) *valid = reference_valid;
+}
+void UAVConfig_LevelObserve(float base_roll, float base_pitch,
+                            float rate_roll, float rate_pitch, float rate_yaw,
+                            float accel_confidence, bool safe_and_fresh)
+{
+    const uint32_t now = HAL_GetTick();
+    const bool valid = isfinite(base_roll) && isfinite(base_pitch) &&
+                       isfinite(rate_roll) && isfinite(rate_pitch) && isfinite(rate_yaw);
+    if (isfinite(base_roll)) level_live_roll = base_roll;
+    if (isfinite(base_pitch)) level_live_pitch = base_pitch;
+    /* Expose why samples cannot accumulate; preserve old fail-closed behavior. */
+    level_observe_reason = !safe_and_fresh ? 1u : !valid ? 2u :
+        (fabsf(rate_roll) > 1.5f || fabsf(rate_pitch) > 1.5f || fabsf(rate_yaw) > 1.5f) ? 3u :
+        (accel_confidence < 0.90f) ? 4u :
+        (fabsf(base_roll) > 10.0f || fabsf(base_pitch) > 10.0f) ? 5u :
+        (level_samples_count && (uint32_t)(now - level_last_observed_ms) > 60u) ? 6u : 0u;
+    if (level_observe_reason != 0u) {
+        level_samples_count = 0u;
+        level_last_sampled_ms = now;
+        level_last_observed_ms = now;
+        return;
+    }
+    level_last_observed_ms = now;
+    if ((uint32_t)(now - level_last_sampled_ms) < LEVEL_SAMPLE_PERIOD_MS) return;
+    level_last_sampled_ms = now;
+    /* Fixed-length recent window, no heap or flash writes in control loop. */
+    if (level_samples_count == LEVEL_SAMPLE_COUNT) {
+        memmove(level_samples, level_samples + 1u,
+                (LEVEL_SAMPLE_COUNT - 1u) * sizeof(level_samples[0]));
+        level_samples_count--;
+    }
+    level_samples[level_samples_count++] = (LevelSample){base_roll, base_pitch};
+    level_observe_reason = level_samples_count < LEVEL_SAMPLE_COUNT ? 7u : 0u;
+}
+static uint8_t level_capture(void)
+{
+    if (level_samples_count != LEVEL_SAMPLE_COUNT ||
+        (uint32_t)(HAL_GetTick() - level_last_observed_ms) > 60u)
+        return UAV_CONFIG_STATUS_BUSY;
+    float sum_r = 0.0f, sum_p = 0.0f;
+    float min_r = 1000.0f, max_r = -1000.0f, min_p = 1000.0f, max_p = -1000.0f;
+    for (uint16_t i = 0; i < LEVEL_SAMPLE_COUNT; ++i) {
+        const float r = level_samples[i].roll, p = level_samples[i].pitch;
+        sum_r += r; sum_p += p;
+        if (r < min_r) min_r = r;
+        if (r > max_r) max_r = r;
+        if (p < min_p) min_p = p;
+        if (p > max_p) max_p = p;
+    }
+    if (max_r - min_r > 0.60f || max_p - min_p > 0.60f)
+        return UAV_CONFIG_STATUS_BUSY;
+    const float r = sum_r / LEVEL_SAMPLE_COUNT, p = sum_p / LEVEL_SAMPLE_COUNT;
+    if (fabsf(r) > LEVEL_MAX_TARE_DEG || fabsf(p) > LEVEL_MAX_TARE_DEG)
+        return UAV_CONFIG_STATUS_RANGE;
+    reference_roll_deg = r;
+    reference_pitch_deg = p;
+    reference_valid = true;
+    return UAV_CONFIG_STATUS_OK;
+}
 static bool flash_dual_bank(void)
 {
 #if defined(FLASH_OPTR_DBANK) && defined(SYSCFG_MEMRMP_FB_MODE)
@@ -78,17 +196,21 @@ static bool record_valid(const ConfigRecord *r)
 }
 static void load_gains(void)
 {
+    level_from_record(NULL);
     if (!flash_dual_bank()) return;
     const ConfigRecord *a = (const ConfigRecord *)FLASH_CFG_PAGE0;
     const ConfigRecord *b = (const ConfigRecord *)FLASH_CFG_PAGE1;
     const bool va = record_valid(a), vb = record_valid(b);
-    if (va && (!vb || (int32_t)(a->generation - b->generation) > 0)) {
-        (void)FlightPID_SetGains(&a->gains); stored_generation = a->generation;
-    } else if (vb) {
-        (void)FlightPID_SetGains(&b->gains); stored_generation = b->generation;
+    const ConfigRecord *latest = NULL;
+    if (va && (!vb || (int32_t)(a->generation - b->generation) > 0)) latest = a;
+    else if (vb) latest = b;
+    if (latest) {
+        (void)FlightPID_SetGains(&latest->gains);
+        stored_generation = latest->generation;
+        level_from_record(latest);
     }
 }
-static bool persist_gains(void)
+static bool persist_config(void)
 {
     if (!flash_dual_bank()) return false;
     const ConfigRecord *a = (const ConfigRecord *)FLASH_CFG_PAGE0;
@@ -104,6 +226,15 @@ static bool persist_gains(void)
     FlightPID_GetGains(&fresh.gains);
     fresh.checksum = hash32((const uint8_t *)&fresh, offsetof(ConfigRecord, checksum));
     fresh.commit = FLASH_CFG_COMMIT;
+    LevelTail level;
+    memset(&level, 0xFF, sizeof(level));
+    level.magic = LEVEL_TAIL_MAGIC;
+    level.version = 1u;
+    level.roll_deg = reference_roll_deg;
+    level.pitch_deg = reference_pitch_deg;
+    level.flags = reference_valid ? 1u : 0u;
+    level.checksum = hash32((const uint8_t *)&level, offsetof(LevelTail, checksum));
+    level.commit = LEVEL_TAIL_COMMIT;
 
     FLASH_EraseInitTypeDef erase = {0};
     erase.TypeErase = FLASH_TYPEERASE_PAGES;
@@ -114,16 +245,28 @@ static bool persist_gains(void)
     if (HAL_FLASH_Unlock() != HAL_OK) return false;
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
     bool ok = HAL_FLASHEx_Erase(&erase, &error_page) == HAL_OK;
-    /* Commit marker is programmed last; never treat a partial write as valid. */
-    for (uint32_t off = 0u; ok && off < sizeof(fresh); off += 8u) {
+    /* Atomically publish BOTH gains and level: header 0..63, footer 72..103,
+     * and only then the legacy commit marker at byte 64. A power loss
+     * before the final marker leaves the previous page authoritative. */
+    for (uint32_t off = 0u; ok && off < offsetof(ConfigRecord, commit); off += 8u) {
         uint64_t word;
         memcpy(&word, ((const uint8_t *)&fresh) + off, sizeof(word));
         ok = (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, dest + off, word) == HAL_OK);
     }
+    for (uint32_t off = 0u; ok && off < sizeof(level); off += 8u) {
+        uint64_t word;
+        memcpy(&word, ((const uint8_t *)&level) + off, sizeof(word));
+        ok = (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                dest + sizeof(fresh) + off, word) == HAL_OK);
+    }
+    if (ok) ok = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                  dest + offsetof(ConfigRecord, commit),
+                                  fresh.commit) == HAL_OK;
     (void)HAL_FLASH_Lock();
     if (ok) {
-        ok = record_valid((const ConfigRecord *)dest) &&
-             ((const ConfigRecord *)dest)->generation == fresh.generation;
+        ok = record_valid((const ConfigRecord *)(uintptr_t)dest) &&
+             level_tail_valid((const LevelTail *)(uintptr_t)(dest + sizeof(fresh))) &&
+             ((const ConfigRecord *)(uintptr_t)dest)->generation == fresh.generation;
     }
     if (ok) stored_generation = fresh.generation;
     return ok;
@@ -141,6 +284,12 @@ void UAVConfig_Init(UART_HandleTypeDef *uart)
     tx_active = false; tx_pending = false; tx_size = 0u;
     boot_armed = false; boot_acked_at = 0u;
     stored_generation = 0u;
+    reference_roll_deg = reference_pitch_deg = 0.0f;
+    reference_valid = false;
+    level_samples_count = 0u;
+    level_live_roll = level_live_pitch = 0.0f;
+    level_observe_reason = 1u;
+    level_last_observed_ms = level_last_sampled_ms = HAL_GetTick();
     load_gains();
     rx_restart = 1u; rx_arm();
 }
@@ -163,7 +312,7 @@ void UAVConfig_OnError(UART_HandleTypeDef *uart)
 {
     if (uart == link_uart) { tx_active = false; rx_restart = 1u; boot_armed = false; }
 }
-static void make_reply(uint8_t request_type, uint16_t seq, uint8_t status, bool safe, bool include_gains)
+static void make_reply(uint8_t request_type, uint16_t seq, uint8_t status, bool safe, bool include_gains, bool include_level)
 {
     if (tx_pending || tx_active) return;
     uint8_t len = 2u;
@@ -177,6 +326,18 @@ static void make_reply(uint8_t request_type, uint16_t seq, uint8_t status, bool 
         FlightPID_GetGains(&gains);
         memcpy(&tx_packet[9], &gains, sizeof(gains));
         len += (uint8_t)sizeof(gains);
+    } else if (include_level) {
+        /* R5.6.1 adds 11 diagnostic bytes after the old 11-byte payload:
+         * live roll/pitch floats, stationary sample count u16, reason u8. */
+        tx_packet[9] = reference_valid ? 1u : 0u;
+        memcpy(&tx_packet[10], &reference_roll_deg, sizeof(float));
+        memcpy(&tx_packet[14], &reference_pitch_deg, sizeof(float));
+        memcpy(&tx_packet[18], &level_live_roll, sizeof(float));
+        memcpy(&tx_packet[22], &level_live_pitch, sizeof(float));
+        tx_packet[26] = (uint8_t)level_samples_count;
+        tx_packet[27] = (uint8_t)(level_samples_count >> 8);
+        tx_packet[28] = level_observe_reason;
+        len += 20u;
     }
     tx_packet[6] = len;
     tx_size = (uint8_t)(7u + len + 2u);
@@ -192,6 +353,7 @@ static void handle_request(bool safe)
     const uint8_t len = request[6];
     uint8_t status = UAV_CONFIG_STATUS_OK;
     bool with_gains = true;
+    bool with_level = false;
     if (tx_active || tx_pending) return;
     switch (type) {
     case UAV_CONFIG_CMD_GET:
@@ -209,7 +371,29 @@ static void handle_request(bool safe)
     case UAV_CONFIG_CMD_SAVE:
         if (!safe) status = UAV_CONFIG_STATUS_LOCKED;
         else if (len != 0u) status = UAV_CONFIG_STATUS_LENGTH;
-        else if (!persist_gains()) status = UAV_CONFIG_STATUS_FLASH;
+        else if (!persist_config()) status = UAV_CONFIG_STATUS_FLASH;
+        break;
+    case UAV_CONFIG_CMD_LEVEL_GET:
+        with_gains = false; with_level = true;
+        if (len != 0u) status = UAV_CONFIG_STATUS_LENGTH;
+        break;
+    case UAV_CONFIG_CMD_LEVEL_CAPTURE:
+        with_gains = false; with_level = true;
+        if (!safe) status = UAV_CONFIG_STATUS_LOCKED;
+        else if (len != 0u) status = UAV_CONFIG_STATUS_LENGTH;
+        else status = level_capture();
+        break;
+    case UAV_CONFIG_CMD_LEVEL_SAVE:
+        with_gains = false; with_level = true;
+        if (!safe) status = UAV_CONFIG_STATUS_LOCKED;
+        else if (len != 0u) status = UAV_CONFIG_STATUS_LENGTH;
+        else if (!persist_config()) status = UAV_CONFIG_STATUS_FLASH;
+        break;
+    case UAV_CONFIG_CMD_LEVEL_CLEAR:
+        with_gains = false; with_level = true;
+        if (!safe) status = UAV_CONFIG_STATUS_LOCKED;
+        else if (len != 0u) status = UAV_CONFIG_STATUS_LENGTH;
+        else { reference_roll_deg = reference_pitch_deg = 0.0f; reference_valid = false; }
         break;
     case UAV_CONFIG_CMD_BOOT:
         with_gains = false;
@@ -226,7 +410,7 @@ static void handle_request(bool safe)
         with_gains = false;
         break;
     }
-    make_reply(type, seq, status, safe, with_gains);
+    make_reply(type, seq, status, safe, with_gains, with_level);
 }
 static void parse_byte(uint8_t c, bool safe)
 {

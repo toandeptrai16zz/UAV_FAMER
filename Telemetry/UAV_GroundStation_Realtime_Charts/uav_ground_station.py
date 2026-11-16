@@ -23,6 +23,11 @@ PACKET_SIZE = 88
 UDP_PORT = 14550
 HELLO = b"UAVT_HELLO"
 
+CAGE_FAULT_NAMES = {
+    0: "OK", 1: "TIMEOUT", 2: "FAST_YAW", 3: "ATTITUDE",
+    4: "RATE_HARD", 5: "INPUT_FAULT", 6: "PILOT_STOP",
+}
+
 FLAG_NAMES = {
     "link_ok": 0,
     "failsafe": 1,
@@ -77,6 +82,9 @@ def decode_frame(data: bytes) -> dict[str, Any] | None:
         "seq": seq,
         "timestamp_ms": timestamp_ms,
         "flags": flags,
+        "cage_latched": bool(flags & 0x8000),
+        "cage_fault_code": (flags >> 12) & 7,
+        "cage_fault": CAGE_FAULT_NAMES.get((flags >> 12) & 7, "UNKNOWN"),
         "rc_throttle": rc[0], "rc_roll": rc[1], "rc_pitch": rc[2], "rc_yaw": rc[3],
         "roll_deg": angles[0] / 100.0, "pitch_deg": angles[1] / 100.0,
         "gyro_roll_dps": gyro[0] / 10.0, "gyro_pitch_dps": gyro[1] / 10.0, "gyro_yaw_dps": gyro[2] / 10.0,
@@ -153,7 +161,7 @@ def run() -> int:
     plotter = LivePlot() if args.plot else None
     output_path = Path(args.csv)
     fieldnames = [
-        "seq", "timestamp_ms", "flags", "link_ok", "failsafe", "armed", "spinning", "imu_fresh",
+        "seq", "timestamp_ms", "flags", "cage_latched", "cage_fault_code", "cage_fault", "link_ok", "failsafe", "armed", "spinning", "imu_fresh",
         "kill_active", "config_ready", "alt_hold", "imu_calibrated", "range_valid", "dma_error", "output_active",
         "rc_throttle", "rc_roll", "rc_pitch", "rc_yaw", "roll_deg", "pitch_deg",
         "gyro_roll_dps", "gyro_pitch_dps", "gyro_yaw_dps", "accel_x_raw", "accel_y_raw", "accel_z_raw",

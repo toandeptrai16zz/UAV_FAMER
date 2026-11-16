@@ -1,0 +1,16 @@
+UAV R5.6 static/host verification — 2026-11-16
+
+1. tests/run_tests.sh: PASS (legacy flight tests, R5 cage lock, Yaw, PID200, IMU1000, CRC/UDP, configuration gate).
+2. tests/test_level_reference.c: PASS (real STM32 config.c linked with fake HAL/dual-bank Flash)
+   - No automatic capture; requires explicit command and 2s stationary window.
+   - Capture lock with CONFIG gate; ±5 degree limit; no capture while moving.
+   - Control frame GET response 11-byte payload and CCITT-FALSE CRC.
+   - Backwards-compatible 72-byte PID record with 32-byte level footer.
+   - Power loss during alternate-page journal write leaves old committed record intact.
+   - Save + reboot restores reference; clear + save + reboot leaves zero reference.
+3. ESP32 HTML JS parser: PASS Node.js --check.
+4. STM32 Cortex-M ARM build: NOT RUN (arm-none-eabi-gcc unavailable here).
+5. ESP32 PlatformIO build: NOT RUN (pio unavailable here).
+6. Live STM32/ESP32 bench & motor testing: NOT RUN.
+
+NOTE: tare is pilot-selected frame reference, not proof of physically level floor/airframe.

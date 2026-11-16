@@ -40,7 +40,7 @@ constexpr uint8_t FRAME_FLIGHT_LEN = 88;
 constexpr int ESP_OTA_BENCH_PIN = 2; // Ground GPIO2 for bench-service OTA without FC telemetry; no microSD.
 constexpr uint32_t ESP_OTA_BENCH_HOLD_MS = 3000;
 constexpr uint32_t ESP_OTA_REBOOT_DELAY_MS = 2200;
-constexpr char ESP_FW_VERSION[] = "UAV-ESP32-DIRECT-AP-UI-v2";
+constexpr char ESP_FW_VERSION[] = "UAV-ESP32-DIRECT-AP-R5.6.1-LV-DIAG";
 // CHANGE WIFI only when DISARMED / CONFIG_READY if valid STM32 telemetry exists.
 Preferences configNvs;
 String apSsid, apPassword, apiToken;
@@ -62,7 +62,7 @@ bool rxControl = false;
 uint16_t reqSeq = 0, responseSeq = 0;
 uint8_t responseType = 0, responseLen = 0, response[60];
 bool responseReady = false;
-uint32_t rxBytes = 0, validFrames = 0, crcErrors = 0, forwardedFrames = 0;
+uint32_t rxBytes = 0, validFrames = 0, validDiagFrames = 0, crcErrors = 0, forwardedFrames = 0;
 uint32_t udpErrors = 0, lastStats = 0;
 bool uploadBad = false, uploadReady = false;
 uint32_t uploadBytes = 0;
@@ -226,10 +226,19 @@ void onFrame() {
     responseLen = rxFrame[6];
     memcpy(response, &rxFrame[7], responseLen);
     responseReady = true;
-  } else if (rxFrame[3] == 1u && crc16(rxFrame, 86) == read16(&rxFrame[86])) {
-    ++validFrames;
-    lastTelemetryMs = millis();
-    lastFlightFlags = read16(&rxFrame[10]);
+  } else if ((rxFrame[3] == 1u || rxFrame[3] == 2u || rxFrame[3] == 3u) &&
+             crc16(rxFrame, 86) == read16(&rxFrame[86])) {
+    /* Flight (type=1), PID200 (type=2) and IMU1000 (type=3) use an 88-byte
+     * UART frame + CCITT CRC. Forward ALL unmodified to Ground Station.
+     * Diagnostic frames have no ARM/KILL flags at offset 10; never use them to
+     * update the last flight-safety state or its freshness timestamp. */
+    if (rxFrame[3] == 1u) {
+      ++validFrames;
+      lastTelemetryMs = millis();
+      lastFlightFlags = read16(&rxFrame[10]);
+    } else {
+      ++validDiagFrames;
+    }
     forwardTelemetry(rxFrame);
   } else ++crcErrors;
 }
@@ -262,7 +271,13 @@ void serviceSerial() {
     ++rxBytes; receiveByte(uint8_t(c));
   }
 }
-struct FcReply { uint8_t status = 0xFF, allowed = 0; float gains[13] = {}; };
+struct FcReply {
+  uint8_t status = 0xFF, allowed = 0, levelValid = 0;
+  float gains[13] = {}, level[2] = {}, live[2] = {};
+  uint16_t levelSamples = 0;
+  uint8_t levelReason = 0;
+  bool hasLive = false;
+};
 bool fcCommand(uint8_t type, const uint8_t *payload, uint8_t len, FcReply &reply) {
   if (len > 52) return false;
   uint8_t req[7 + 52 + 2];
@@ -281,6 +296,16 @@ bool fcCommand(uint8_t type, const uint8_t *payload, uint8_t len, FcReply &reply
       if (responseLen < 2) return false;
       reply.status = response[0]; reply.allowed = response[1];
       if (responseLen == 54) memcpy(reply.gains, &response[2], 52);
+      if (responseLen == 11 || responseLen == 22) {
+        reply.levelValid = response[2];
+        memcpy(reply.level, &response[3], 8);
+        if (responseLen == 22) {
+          memcpy(reply.live, &response[11], 8);
+          reply.levelSamples = uint16_t(response[19]) | (uint16_t(response[20]) << 8);
+          reply.levelReason = response[21];
+          reply.hasLive = isfinite(reply.live[0]) && isfinite(reply.live[1]);
+        }
+      }
       return true;
     }
     delay(1);
@@ -330,6 +355,36 @@ void apiPidSave() {
   FcReply r;
   if (!fcCommand(0x12, nullptr, 0, r)) { http.send(504, "application/json", "{\"error\":\"STM32 no reply\"}"); return; }
   http.send(r.status == 0 ? 200 : 409, "application/json", floatJSON(r));
+}
+void apiLevelCommand(uint8_t type) {
+  if (!requireAuth()) return;
+  FcReply r;
+  if (!fcCommand(type, nullptr, 0, r)) {
+    http.send(504, "application/json", "{\"error\":\"STM32 no reply\"}"); return;
+  }
+  if (!isfinite(r.level[0]) || !isfinite(r.level[1])) {
+    http.send(502, "application/json", "{\"error\":\"invalid STM32 level response\"}"); return;
+  }
+  String error = "";
+  switch (r.status) {
+    case 1: error = "STM32 khoa thao tac (ARM/KILL/CONFIG READY)"; break;
+    case 3: error = "Goc do vuot +/-5 do; khong ghi moc"; break;
+    case 6: error = "Chua co du 100 mau dung yen lien tuc (2 giay)"; break;
+    case 5: error = "STM32 khong luu duoc Flash"; break;
+    case 2: error = "Lenh sai do dai"; break;
+    default: if (r.status != 0) error = "STM32 tu choi lenh: " + String(r.status); break;
+  }
+  String json = String("{\"status\":") + String(r.status) +
+    ",\"config_allowed\":" + (r.allowed ? "true" : "false") +
+    ",\"valid\":" + (r.levelValid ? "true" : "false") +
+    ",\"roll_deg\":" + String(r.level[0], 5) +
+    ",\"pitch_deg\":" + String(r.level[1], 5) +
+    ",\"live_roll_deg\":" + (r.hasLive ? String(r.live[0], 5) : "null") +
+    ",\"live_pitch_deg\":" + (r.hasLive ? String(r.live[1], 5) : "null") +
+    ",\"stationary_samples\":" + String(r.levelSamples) +
+    ",\"reason_code\":" + String(r.levelReason) +
+    ",\"error\":" + jsonQuote(error) + "}";
+  http.send(r.status == 0 ? 200 : 409, "application/json", json);
 }
 
 /* ST AN3155 USART bootloader. Bench-only and OFF in STM32 build by default.
@@ -660,7 +715,7 @@ a{color:#8dd4ff;text-decoration:none}a:hover{text-decoration:underline}button,in
   <div class="top-right"><span id="linkPill" class="pill"><i class="pulse"></i> CHƯA XÁC THỰC</span><span class="pill">DIRECT AP · 2.4 GHz</span></div>
 </header>
 <section class="hero"><div><div class="eyebrow">TRẠM GIÁM SÁT & CẤU HÌNH</div><h1>Flight Control Dashboard</h1><p>Giám sát đường truyền UART / UDP, đọc và điều chỉnh PID STM32, cập nhật firmware ESP32-CAM — tất cả qua Wi-Fi trực tiếp.</p></div><div class="hero-tag"><div style="font-size:20px;color:#77dfc2" aria-hidden="true">◉</div><div><small>ĐỊA CHỈ THIẾT BỊ</small><b>192.168.4.1</b></div></div></section>
-<div class="safety"><span class="safety-icon" aria-hidden="true">⚠</span><div><strong>Chỉ cấu hình trên bàn:</strong> tháo cánh quạt, ngắt nguồn động lực, ARM OFF, KILL ON, ga thấp, CH8 CONFIG ON. Wi-Fi 2.4 GHz có thể ảnh hưởng bộ thu RC cùng băng tần.</div></div>
+<div class="safety"><span class="safety-icon" aria-hidden="true">⚠</span><div><strong>Chỉ cấu hình trên bàn:</strong> tháo cánh quạt, ngắt nguồn động lực, ARM OFF, KILL ON, ga thấp, RC 6 kênh ổn định. Wi-Fi 2.4 GHz có thể ảnh hưởng bộ thu RC cùng băng tần.</div></div>
 <section class="metrics" aria-label="Chỉ số đường truyền">
   <article class="metric"><div class="metric-label">UART RX</div><div class="metric-main"><span id="mUart" class="metric-value">—</span></div><div id="fUart" class="metric-foot">Tổng số byte STM32 → ESP32</div></article>
   <article class="metric"><div class="metric-label">Telemetry frames</div><div class="metric-main"><span id="mFrames" class="metric-value">—</span></div><div id="fFrames" class="metric-foot">Chưa đọc dữ liệu</div></article>
@@ -677,6 +732,25 @@ a{color:#8dd4ff;text-decoration:none}a:hover{text-decoration:underline}button,in
        <label class="checkbox"><input id="benchConfirm" type="checkbox"><span>Tôi xác nhận đã <b>tháo cánh, ngắt nguồn động lực</b> và đặt STM32 ở trạng thái cấu hình an toàn.</span></label>
        <div class="button-row"><button id="pidReadBtn" class="btn primary" onclick="loadPid()"><span class="ico">↻</span> Đọc PID</button><button id="pidApplyBtn" class="btn outline" onclick="applyPid()" disabled>Áp dụng RAM</button><button id="pidSaveBtn" class="btn amber" onclick="savePid()" disabled>Lưu Flash</button></div>
        <div class="pid-foot"><span id="pidHint" class="help">Đọc PID để lấy thông số từ STM32.</span><span class="tiny">13 thông số · Không tự ghi Flash</span></div>
+     </div>
+   </section>
+   <section class="panel" id="levelPanel">
+     <div class="panel-head"><div class="head-title"><span class="section-mark">L</span><div><h2>Mốc tư thế khung / IMU</h2><p>Đặt mốc thủ công khi khung đứng yên, KHÔNG tự cân bằng theo nền nhà.</p></div></div><div id="levelBadge" class="pill">CHƯA ĐỌC</div></div>
+     <div class="panel-body">
+       <div class="info-row"><span>Roll tham chiếu</span><strong id="levelRoll">—</strong></div>
+       <div class="info-row"><span>Pitch tham chiếu</span><strong id="levelPitch">—</strong></div>
+       <div class="info-row"><span>Roll đang đo (góc gốc)</span><strong id="levelLiveRoll">—</strong></div>
+       <div class="info-row"><span>Pitch đang đo (góc gốc)</span><strong id="levelLivePitch">—</strong></div>
+       <div class="info-row"><span>Mẫu đứng yên (cần 100)</span><strong id="levelCount">—</strong></div>
+       <p id="levelStateReason" class="ota-small">Nhấn Đọc mốc để xem điều kiện lấy mốc. Hai số tham chiếu 0° không phải góc trực tiếp.</p>
+       <p class="ota-small">Đây là thao tác <b>tare</b> theo tư thế bạn chọn, KHÔNG phát hiện được góc nghiêng thật của nền/gá IMU. Chỉ dùng khi tháo cánh, ngắt điện ESC, ARM OFF, KILL ON, ga thấp, CONFIG READY và giữ khung đứng yên ít nhất 2 giây. Giới hạn |mốc| ≤ 5° mỗi trục.</p>
+       <div class="button-row">
+         <button id="levelReadBtn" class="btn outline" onclick="readLevel()">Đọc mốc</button>
+         <button id="levelCaptureBtn" class="btn primary" onclick="captureLevel()" disabled>Đặt mốc vào RAM</button>
+         <button id="levelSaveBtn" class="btn amber" onclick="saveLevel()" disabled>Lưu Flash</button>
+         <button id="levelClearBtn" class="btn outline" onclick="clearLevel()" disabled>Xóa mốc RAM</button>
+       </div>
+       <p id="levelHint" class="ota-small">Mốc mới chỉ tồn tại trong RAM đến khi bấm Lưu Flash; lưu sẽ ghi cả PID đang có.</p>
      </div>
    </section>
  </div>
@@ -728,12 +802,19 @@ $('attitudeInputs').innerHTML=inputMarkup(0,'Angle Kp')+inputMarkup(1,'Max rate 
 $('rateInputs').innerHTML=[['ROLL',2,5,8],['PITCH',3,6,9],['YAW',4,7,10]].map(r=>`<div class="axis-row"><div class="axis-title">${r[0]}</div>${inputMarkup(r[1],'Kp')}${inputMarkup(r[2],'Ki')}${inputMarkup(r[3],'Kd')}</div>`).join('');
 $('limitInputs').innerHTML=inputMarkup(11,'Integral limit')+inputMarkup(12,'Correction limit');
 let pidLoaded=false,pidWriteAllowed=false,pidDirty=false,otaAllowed=false,otaBusy=false,workBusy=false,prevStatus=null,pollTimer=null;
+let levelLoaded=false;
 const tokenInput=$('token');
 try{tokenInput.value=sessionStorage.getItem('uavtoken')||''}catch(e){}
 function logMessage(message){$('msg').textContent=typeof message==='string'?message:JSON.stringify(message,null,2);$('logClock').textContent=new Date().toLocaleTimeString('vi-VN')}
 function show(message){logMessage(message)}
 function authBadge(kind,message){$('linkPill').className='pill '+kind;$('linkPill').innerHTML='<i class="pulse"></i> '+message;$('authState').className='status-line '+(kind==='good'?'success':kind==='warn'?'error':'');$('authState').textContent=message}
-function applyButtons(){const confirmed=$('benchConfirm').checked;const canWrite=pidLoaded&&pidWriteAllowed&&confirmed&&!workBusy;$('pidApplyBtn').disabled=!canWrite;$('pidSaveBtn').disabled=!canWrite;$('pidReadBtn').disabled=workBusy;$('otaUploadBtn').disabled=!otaAllowed||!confirmed||otaBusy||!$('espbin').files.length;$('otaCheckBtn').disabled=otaBusy}
+function applyButtons(){const confirmed=$('benchConfirm').checked;const canWrite=pidLoaded&&pidWriteAllowed&&confirmed&&!workBusy;$('pidApplyBtn').disabled=!canWrite;$('pidSaveBtn').disabled=!canWrite;$('pidReadBtn').disabled=workBusy;
+$('levelReadBtn').disabled=workBusy;
+const levelWrite=pidWriteAllowed&&levelLoaded&&confirmed&&!workBusy&&!otaBusy;
+$('levelCaptureBtn').disabled=!levelWrite;
+$('levelClearBtn').disabled=!levelWrite;
+$('levelSaveBtn').disabled=!levelWrite;
+$('otaUploadBtn').disabled=!otaAllowed||!confirmed||otaBusy||!$('espbin').files.length;$('otaCheckBtn').disabled=otaBusy}
 $('benchConfirm').addEventListener('change',applyButtons);
 for(let i=0;i<13;i++)$('f'+i).addEventListener('input',()=>{pidDirty=true;$('pidHint').textContent='Có thay đổi chưa áp dụng vào STM32.'});
 function toggleToken(){tokenInput.type=tokenInput.type==='password'?'text':'password'}
@@ -742,11 +823,57 @@ function setMeter(id,n){$(id).textContent=typeof n==='number'?fmt(n):'—'}
 async function wifiStatus(silent=false){if(otaBusy||workBusy)return;try{const d=await call('/api/status');const wifi=d.wifi||{};setMeter('mUart',d.uart_bytes);setMeter('mFrames',d.frames);setMeter('mUdp',d.udp_sent);setMeter('mCrc',d.crc_bad);$('ssidValue').textContent=wifi.ap_ssid||'—';$('ipValue').textContent=wifi.ap_ip||'192.168.4.1';$('clientValue').textContent=wifi.ap_clients??'—';$('apMode').textContent=wifi.mode||'DIRECT AP';$('lastUpdate').textContent=new Date().toLocaleTimeString('vi-VN');if(prevStatus){const seconds=(Date.now()-prevStatus.at)/1000;if(seconds>0.3){const hz=(Math.max(0,d.frames-prevStatus.frames)/seconds);$('fFrames').textContent='Nhận UART ~ '+hz.toFixed(1)+' frames/s';$('fFrames').className='metric-foot '+(hz>15?'ok':hz<2?'alert':'');const uhz=Math.max(0,d.udp_sent-prevStatus.udp)/seconds;$('fUdp').textContent='Gửi UDP ~ '+uhz.toFixed(1)+' gói/s';$('fUdp').className='metric-foot '+(uhz>10?'ok':'')}}else{$('fFrames').textContent=d.frames>0?'Đã nhận dữ liệu STM32':'Chưa có frame UART'}$('fCrc').textContent=d.crc_bad===0?'Không có lỗi CRC':'Kiểm tra đường UART';$('fCrc').className='metric-foot '+(d.crc_bad===0?'ok':'alert');$('fUart').textContent=d.uart_bytes>0?'ESP32 đang có dữ liệu UART':'Chưa nhận byte UART';prevStatus={at:Date.now(),frames:d.frames,udp:d.udp_sent};authBadge(wifi.ap_active?'good':'warn',wifi.ap_active?'LIÊN KẾT AP HOẠT ĐỘNG':'AP KHÔNG HOẠT ĐỘNG');if(!silent)logMessage('Cập nhật trạng thái thành công. UART frames: '+d.frames+'; UDP: '+d.udp_sent+'.');return d}catch(e){authBadge('warn','KHÔNG ĐỌC ĐƯỢC TRẠNG THÁI');if(!silent)logMessage('Trạng thái: '+e.message);return null}}
 function init(){wifiStatus(false)}
 function checkSafe(){if(!$('benchConfirm').checked)throw Error('Chưa xác nhận tháo cánh và ngắt nguồn động lực')}
-function fillPid(data){if(!Array.isArray(data.gains)||data.gains.length!==13)throw Error('Gói PID thiếu 13 giá trị');data.gains.forEach((v,i)=>{if(!Number.isFinite(Number(v)))throw Error('PID không hợp lệ tại '+specs[i].key);$('f'+i).value=String(v)});pidLoaded=true;pidWriteAllowed=!!data.config_allowed;pidDirty=false;for(let i=0;i<13;i++)$('f'+i).disabled=!pidWriteAllowed;$('pidBadge').className='pill '+(pidWriteAllowed?'good':'warn');$('pidBadge').textContent=pidWriteAllowed?'CONFIG READY':'CHỈ ĐỌC / KHÓA GHI';$('pidHint').textContent=pidWriteAllowed?'Đã đọc PID. Có thể chỉnh giá trị sau khi xác nhận an toàn.':'Đã đọc PID. STM32 chưa cho phép ghi; cần DISARM + KILL + CH8 CONFIG.';applyButtons()}
+function fillPid(data){if(!Array.isArray(data.gains)||data.gains.length!==13)throw Error('Gói PID thiếu 13 giá trị');data.gains.forEach((v,i)=>{if(!Number.isFinite(Number(v)))throw Error('PID không hợp lệ tại '+specs[i].key);$('f'+i).value=String(v)});pidLoaded=true;pidWriteAllowed=!!data.config_allowed;pidDirty=false;for(let i=0;i<13;i++)$('f'+i).disabled=!pidWriteAllowed;$('pidBadge').className='pill '+(pidWriteAllowed?'good':'warn');$('pidBadge').textContent=pidWriteAllowed?'CONFIG READY':'CHỈ ĐỌC / KHÓA GHI';$('pidHint').textContent=pidWriteAllowed?'Đã đọc PID. Có thể chỉnh giá trị sau khi xác nhận an toàn.':'Đã đọc PID. STM32 chưa cho phép ghi; cần ARM OFF, KILL ON, ga thấp và RC ổn định.';applyButtons()}
 async function loadPid(){if(workBusy||otaBusy)return;workBusy=true;applyButtons();try{const d=await call('/api/pid');fillPid(d);logMessage('Đọc PID thành công. STM32: '+(pidWriteAllowed?'cho phép cấu hình':'chưa cho phép ghi')+'.')}catch(e){logMessage('Đọc PID lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
 function collectGains(){const values=specs.map(s=>Number($('f'+s.id).value));if(values.some((v,i)=>!Number.isFinite(v)||$('f'+i).value.trim()===''))throw Error('Phải nhập đầy đủ 13 giá trị số hữu hạn');return values}
 async function applyPid(){if(workBusy||otaBusy)return;try{checkSafe();if(!pidLoaded||!pidWriteAllowed)throw Error('Cần Đọc PID và STM32 phải cho phép cấu hình');const values=collectGains();if(!confirm('Áp dụng 13 giá trị PID vào RAM STM32?\nThay đổi có thể ảnh hưởng điều khiển; UAV đã tháo cánh và ngắt nguồn động lực?'))return;workBusy=true;applyButtons();const d=await call('/api/pid','POST',values.join(','),'text/plain');fillPid(d);logMessage('Áp dụng PID vào RAM thành công. Chưa ghi Flash.')}catch(e){logMessage('Áp dụng RAM lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
-async function savePid(){if(workBusy||otaBusy)return;try{checkSafe();if(!pidLoaded||!pidWriteAllowed)throw Error('STM32 chưa cho phép cấu hình');if(pidDirty)throw Error('Có giá trị thay đổi chưa áp dụng RAM. Hãy bấm Áp dụng RAM trước.');if(!confirm('GHI PID XUỐNG FLASH STM32?\nChỉ làm khi nguồn ổn định, đã tháo cánh, ngắt nguồn động lực, ARM OFF/KILL ON/CH8 CONFIG ON.'))return;workBusy=true;applyButtons();const d=await call('/api/save','POST');if(d.status!==0)throw Error('STM32 từ chối lưu PID');logMessage('STM32 xác nhận đã lưu PID vào Flash.')}catch(e){logMessage('Save Flash lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
+async function savePid(){if(workBusy||otaBusy)return;try{checkSafe();if(!pidLoaded||!pidWriteAllowed)throw Error('STM32 chưa cho phép cấu hình');if(pidDirty)throw Error('Có giá trị thay đổi chưa áp dụng RAM. Hãy bấm Áp dụng RAM trước.');if(!confirm('GHI PID XUỐNG FLASH STM32?\nChỉ làm khi nguồn ổn định, đã tháo cánh, ngắt nguồn động lực, ARM OFF/KILL ON, ga thấp, CONFIG READY.'))return;workBusy=true;applyButtons();const d=await call('/api/save','POST');if(d.status!==0)throw Error('STM32 từ chối lưu PID');logMessage('STM32 xác nhận đã lưu PID vào Flash.')}catch(e){logMessage('Save Flash lỗi: '+e.message)}finally{workBusy=false;applyButtons()}}
+function fillLevel(data){
+ if(data.status!==0)throw Error(data.error||('STM32 từ chối, status '+data.status));
+ levelLoaded=true;pidWriteAllowed=!!data.config_allowed;
+ $('levelRoll').textContent=Number(data.roll_deg).toFixed(3)+'°';
+ $('levelPitch').textContent=Number(data.pitch_deg).toFixed(3)+'°';
+ $('levelBadge').className='pill '+(data.valid?'good':'warn');
+ $('levelBadge').textContent=data.valid?'ĐÃ ĐẶT MỐC':'MỐC MẶC ĐỊNH 0°';
+ const angleOK = Number.isFinite(data.live_roll_deg)&&Number.isFinite(data.live_pitch_deg);
+ $('levelLiveRoll').textContent=angleOK?Number(data.live_roll_deg).toFixed(3)+'°':'—';
+ $('levelLivePitch').textContent=angleOK?Number(data.live_pitch_deg).toFixed(3)+'°':'—';
+ $('levelCount').textContent=Number.isFinite(data.stationary_samples)?data.stationary_samples+'/100':'—';
+ const reasons={0:'Đang tích lũy mẫu hoặc đủ điều kiện.',1:'STM32 chưa xác nhận điều kiện an toàn/IMU.',2:'Mẫu IMU không hợp lệ.',3:'Drone đang chuyển động (gyro >1.5°/s).',4:'Gia tốc không đáng tin cậy.',5:'Góc thô vượt ±10°.',6:'Mất liên tục khi lấy mẫu.',7:'Đang chờ đủ 100 mẫu tĩnh.'};
+ const tooFar = angleOK&&(Math.abs(data.live_roll_deg)>5||Math.abs(data.live_pitch_deg)>5);
+ $('levelStateReason').textContent=tooFar?'Góc hiện tại vượt ±5° nên nút Đặt mốc sẽ bị từ chối.':
+   (reasons[data.reason_code]||'Trạng thái IMU chưa xác định.')+
+   ' Nhấn Đọc mốc để cập nhật góc hiện tại.';
+ applyButtons();
+}
+async function readLevel(){
+ if(workBusy||otaBusy)return;workBusy=true;applyButtons();
+ try{fillLevel(await call('/api/level'));logMessage('Đã đọc mốc + góc hiện tại từ STM32.');}
+ catch(e){logMessage('Lỗi đọc mốc khung: '+e.message)}finally{workBusy=false;applyButtons()}
+}
+async function changeLevel(path,question,done){
+ if(workBusy||otaBusy)return;
+ try{checkSafe();if(!pidWriteAllowed)throw Error('Cần Đọc PID và CONFIG READY trước.');
+   if(!confirm(question))return;
+   workBusy=true;applyButtons();
+   const d=await call(path,'POST');fillLevel(d);
+   $('levelHint').textContent=done;
+   logMessage(done);
+ }catch(e){
+   $('levelHint').textContent='KHÔNG đặt được mốc: '+e.message+'. Mốc cũ được giữ nguyên.';
+   logMessage('Hiệu chuẩn mốc lỗi: '+e.message);
+ }
+ finally{workBusy=false;applyButtons()}
+}
+async function captureLevel(){await changeLevel('/api/level/capture',
+ 'ĐẶT MỐC TƯ THẾ KHUNG VÀO RAM?\nĐiều này đưa góc hiện tại về 0° nhưng KHÔNG có nghĩa khung thực sự ngang trọng lực.\nTháo cánh, ngắt nguồn ESC, ARM OFF/KILL ON; khung giữ yên tối thiểu 2 giây.',
+ 'Đặt mốc RAM thành công; chưa lưu Flash. Sau đó kiểm tra lại góc và dấu trục.')}
+async function saveLevel(){await changeLevel('/api/level/save',
+ 'GHI MỐC + PID HIỆN TẠI XUỐNG FLASH STM32?\nKhông ngắt nguồn trong khi ghi. Chỉ làm khi đã kiểm tra trên bàn.',
+ 'Đã lưu mốc + PID trong Flash STM32. Hãy reset và Đọc mốc để xác nhận.')}
+async function clearLevel(){await changeLevel('/api/level/clear',
+ 'XÓA MỐC TƯ THẾ KHỎI RAM?\nFirmware sẽ quay lại góc gốc của bộ ước lượng. Muốn xóa trong Flash phải bấm Lưu Flash.',
+ 'Đã xóa mốc RAM, chưa thay đổi Flash.')}
 async function espOtaInfo(){if(otaBusy)return;try{const d=await call('/api/esp32/ota/info');otaAllowed=!!d.can_update;$('espota_info').textContent='Firmware '+d.version+' · Slot '+fmt(d.ota_bytes_free)+' bytes · '+(otaAllowed?'ĐỦ ĐIỀU KIỆN OTA':'CHƯA ĐỦ ĐIỀU KIỆN: '+d.safety);$('espota_info').className='ota-state '+(otaAllowed?'good':'bad');applyButtons();return d}catch(e){otaAllowed=false;$('espota_info').textContent='Lỗi kiểm tra OTA: '+e.message;$('espota_info').className='ota-state bad';applyButtons();return null}}
 function showFileInfo(){const f=$('espbin').files[0];$('fileInfo').textContent=f?('Đã chọn: '+f.name+' · '+fmt(f.size)+' bytes'):'Chưa chọn file firmware.';applyButtons()}
 function sha256Local(input){
@@ -814,12 +941,14 @@ void setup() {
   http.on("/health", HTTP_GET, [](){
     http.send(200, "text/plain; charset=utf-8", String("ESP32 UAV RUNNING; AP=") +
               (setupAPActive ? "ON" : "OFF") + "; STA=" + String(int(WiFi.status())) +
-              "; DIRECT_AP=1");
+              "; DIRECT_AP=1; FW=" + String(ESP_FW_VERSION));
   });
   http.on("/", HTTP_GET, [](){ http.send_P(200, "text/html; charset=utf-8", HOME_HTML); });
   http.on("/api/status", HTTP_GET, [](){
     if (!requireAuth()) return;
     String json = "{\"wifi\":" + wifiStateJSON() + ",\"uart_bytes\":" + String(rxBytes) + ",\"frames\":" + String(validFrames) +
+                  ",\"diag_frames\":" + String(validDiagFrames) +
+                  ",\"esp_uptime_ms\":" + String(millis()) +
                   ",\"crc_bad\":" + String(crcErrors) + ",\"udp_sent\":" + String(forwardedFrames) + "}";
     http.send(200, "application/json", json);
   });
@@ -827,6 +956,10 @@ void setup() {
   http.on("/api/pid", HTTP_GET, apiPidGet);
   http.on("/api/pid", HTTP_POST, apiPidApply);
   http.on("/api/save", HTTP_POST, apiPidSave);
+  http.on("/api/level", HTTP_GET, [](){ apiLevelCommand(0x14); });
+  http.on("/api/level/capture", HTTP_POST, [](){ apiLevelCommand(0x15); });
+  http.on("/api/level/save", HTTP_POST, [](){ apiLevelCommand(0x16); });
+  http.on("/api/level/clear", HTTP_POST, [](){ apiLevelCommand(0x17); });
   http.on("/api/ota", HTTP_POST, apiOTA, onUpload); // STM32 OTA (unchanged)
   http.on("/api/esp32/ota/info", HTTP_GET, apiEspOtaInfo);
   http.on("/api/esp32/ota", HTTP_POST, apiEspOtaFinish, espOtaOnUpload);

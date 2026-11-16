@@ -28,6 +28,9 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/flight_pid.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/rc_input.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_telemetry.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_rate_blackbox.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_imu_raw.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_cage_guard.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/uav_config.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Core/Src/stm32g4xx_hal_msp.c

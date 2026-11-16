@@ -1,0 +1,108 @@
+--- R5.6.1/Core/Src/uav_test.c
++++ R5.7/Core/Src/uav_test.c
+@@ -137,12 +137,13 @@
+ #ifndef IMU_PITCH_MOUNT_TRIM_DEG
+ #define IMU_PITCH_MOUNT_TRIM_DEG     0.24f
+ #endif
+-/* R5 captive-cage diagnostic. This unlocks motor output for ONE short
+- * monitored test per power cycle, not for free flight or tuning by guesswork.
+- * Hardwired independent motor-power cutout and a physically protected cage
+- * are required. Use 0 to restore locked R4 diagnostic behavior. */
++/* R5.7 restricted-area flight trial: removes the old 5.5-second cage timer,
++ * automatic cage tilt/yaw/rate trips and temporary DShot 1550 ceiling.
++ * DOES NOT bypass manual KILL, SBUS loss/failsafe, IMU validity, DShot DMA
++ * interlocks, low-throttle pre-ARM or ARM switch edge requirements.
++ * Verify MOTOR ORDER, prop orientation and independent ESC power cutoff. */
+ #ifndef UAV_CAGE_TEST_ARM_ENABLE
+-#define UAV_CAGE_TEST_ARM_ENABLE       1u
++#define UAV_CAGE_TEST_ARM_ENABLE       0u
+ #endif
+ /* The legacy flight candidate ARM machine remains underneath the new guard. */
+ #define UAV_EXPERIMENTAL_ARM_ENABLE  1u
+@@ -212,13 +213,10 @@
+  * nose clockwise as seen from above must report POSITIVE gyro_yaw_dps.
+  * Do not change without physically confirming the sensor's orientation. */
+ #define UAV_BODY_YAW_SENSOR_SIGN      (-1.0f)
+-/* Diagnostic firmware is intentionally non-flying. The latest powered run
+- * reached the old gyro measurement rail and showed contradictory response
+- * between requested yaw torque and yaw acceleration. Diagnose signs first.
+- * This macro may only be cleared after a shielded, instrumented torque check.
+- * It is separate from KILL/ARM logic and MUST NOT bypass either. */
++/* This release uses the standard pilot-ARM state machine, not R4's
++ * diagnostic motor-output lock. Safety interlocks above remain active. */
+ #ifndef UAV_YAW_DIAGNOSTIC_ARM_LOCK
+-#define UAV_YAW_DIAGNOSTIC_ARM_LOCK    (UAV_CAGE_TEST_ARM_ENABLE ? 0u : 1u)
++#define UAV_YAW_DIAGNOSTIC_ARM_LOCK    0u
+ #endif
+ #if UAV_CAGE_TEST_ARM_ENABLE && UAV_YAW_DIAGNOSTIC_ARM_LOCK
+ #error "CAGE ARM requested but diagnostic lock remains enabled"
+@@ -1353,6 +1351,17 @@
+  * disarmed, KILL ON and all outputs have stopped. */
+ static void bb_record_if_due(uint32_t now_ms, bool kill_on)
+ {
++    /* A motor shutdown may coincide with an invalid/stale IMU or occur less
++     * than 5 ms after the last Blackbox sample. Preserve the final powered
++     * window even when the normal sample-rate gate rejects this tick. */
++    const bool motor_now_on = armed && spinning && !kill_on &&
++        ((output_dshot[0] | output_dshot[1] |
++          output_dshot[2] | output_dshot[3]) != 0u);
++    if (bb_prev_cage_powered && !motor_now_on) {
++        UAVIMURaw_MotorStopped();
++        UAVBB_FreezeNow();
++        bb_prev_cage_powered = false;
++    }
+     if (!imu_control_valid || imu_sample_sequence == bb_last_imu_seq ||
+         (uint32_t)(now_ms - bb_last_sample_ms) < UAV_BB_PERIOD_MS) return;
+     bb_last_imu_seq = imu_sample_sequence;
+@@ -1384,24 +1393,21 @@
+     const float mag = fmaxf(fabsf(body_yaw_rate_dps()),
+                            fmaxf(fabsf(body_roll_rate_dps()), fabsf(body_pitch_rate_dps())));
+     const bool motors_on = (s.motor[0] | s.motor[1] | s.motor[2] | s.motor[3]) != 0u;
+-    const bool cage_powered = UAV_CAGE_TEST_ARM_ENABLE && armed && spinning &&
+-                              motors_on && !kill_on;
+-    if (cage_powered && bb_spinning_since==0u) bb_spinning_since=now_ms;
+-    const bool cage_just_started = !bb_prev_cage_powered && cage_powered;
+-    const bool cage_just_stopped = bb_prev_cage_powered && !cage_powered;
+-    if (cage_just_started) UAVIMURaw_MotorStarted();
+-    if (cage_just_stopped) UAVIMURaw_MotorStopped();
+-    bb_prev_cage_powered = cage_powered;
+-    if (!cage_powered) bb_spinning_since=0u;
+-    /* During the cage run retain a ROLLING 512-sample window instead of
+-     * freezing ~0.8 s after first motor output.  The guard freeze at the
+-     * end captures the LAST ~2.56 s, including the actual cutoff response.
+-     * If the pilot stops without a guard latch, trigger post-stop capture.
+-     */
+-    const bool cage_trigger = cage_just_stopped;
+-    const bool passive_trigger = !UAV_CAGE_TEST_ARM_ENABLE && !armed && !spinning &&
++    /* Record every NORMAL powered run, not just cage-mode sessions.
++     * Capture a rolling IMU window during flight and freeze it at pilot stop
++     * or any disarm; transmit only after motors are zero and KILL is ON. */
++    const bool motors_powered = armed && spinning && motors_on && !kill_on;
++    if (motors_powered && bb_spinning_since==0u) bb_spinning_since=now_ms;
++    const bool motor_just_started = !bb_prev_cage_powered && motors_powered;
++    const bool motor_just_stopped = bb_prev_cage_powered && !motors_powered;
++    if (motor_just_started) UAVIMURaw_MotorStarted();
++    if (motor_just_stopped) UAVIMURaw_MotorStopped();
++    bb_prev_cage_powered = motors_powered;
++    if (!motors_powered) bb_spinning_since=0u;
++    const bool passive_trigger = !armed && !spinning &&
+           kill_on && !motors_on && mag>=45.0f;
+-    UAVBB_Push(&s, cage_trigger || passive_trigger);
++    UAVBB_Push(&s, passive_trigger);
++    if (motor_just_stopped) UAVBB_FreezeNow();
+ }
+ 
+ /* ----------------------------- Public API ----------------------------- */
+@@ -1584,10 +1590,8 @@
+     now = HAL_GetTick();
+     (void)DPS310_GetData(&barometer, &baro_data);
+ 
+-    /* FLIGHT CANDIDATE telemetry.
+-     * B/M/CMD are zero because the props-off scanner is compiled out.
+-     * O is the actual DShot command vector. Do not use this candidate for
+-     * powered flight until the propeller-off axis/mixer checks pass.
++    /* R5.7 flight telemetry: O is the actual four-channel DShot vector.
++     * All PID200 and IMU1000 capture is retained after pilot DISARM + KILL.
+      */
+     if (UAV_SHARED_UART_PERIODIC_ASCII && !UAVBB_Dumping() &&
+         (now - last_log_ms) >= LOG_PERIOD_MS) {

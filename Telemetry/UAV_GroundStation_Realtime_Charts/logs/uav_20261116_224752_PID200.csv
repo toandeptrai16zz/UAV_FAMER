@@ -1,0 +1,1 @@
+received_at_utc,capture_id,capture_index,capture_total,stamp_ms,pid_dt_us,motor_dt_us,gyro_roll_dps,gyro_pitch_dps,gyro_yaw_dps,rate_set_roll_dps,rate_set_pitch_dps,rate_set_yaw_dps,roll_p,pitch_p,yaw_p,roll_i,pitch_i,yaw_i,roll_d,pitch_d,yaw_d,out_m1,out_m2,out_m3,out_m4,base_dshot,mixer_scale,imu_seq,flags

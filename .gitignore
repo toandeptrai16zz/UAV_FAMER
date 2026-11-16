@@ -93,3 +93,4 @@ backup_code/
 *.log
 .DS_Store
 Thumbs.db
+/PCB/PCB_2_Tang/library/NUCLEO-F411RE.STEP
