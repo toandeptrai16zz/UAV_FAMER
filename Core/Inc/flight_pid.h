@@ -24,6 +24,9 @@ typedef struct {
     float integrator[3];
     float gyro_prev[3];
     float gyro_deriv_filt[3];
+    /* Diagnostics only, no change to the 52-byte configuration protocol. */
+    float rate_set_dps[3], rate_error_dps[3];
+    float pid_p[3], pid_i[3], pid_d[3];
     bool has_prev;
 } FlightPIDState;
 
@@ -33,6 +36,8 @@ typedef struct {
     float gyro_roll_dps, gyro_pitch_dps, gyro_yaw_dps;
     float dt_s;
     bool allow_integrator;
+    /* Reset when motor output is off; otherwise hold I during transients. */
+    bool reset_integrator;
 } FlightPIDInput;
 
 typedef struct { float roll, pitch, yaw; } FlightPIDOutput;

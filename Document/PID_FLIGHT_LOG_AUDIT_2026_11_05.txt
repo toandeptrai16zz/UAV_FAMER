@@ -1,0 +1,15 @@
+# PID/Flight log audit — read-only
+File: uav_20261105_121328.csv
+CSV samples: 4873; spinning+output: 1232; neutral: 1225
+IMPORTANT: motor outputs are DShot commands, NOT ESC RPM or measured thrust.
+Static/motor median angles (spinning): roll=10.48°, pitch=3.08°
+  roll  gyro max abs=150.6°/s, PID max abs=198.9
+  pitch gyro max abs=141.5°/s, PID max abs=200.0
+  yaw   gyro max abs=236.9°/s, PID max abs=200.0
+Motor DShot requested median spread=197.0, max spread=715.0
+RC-neutral + range>=15 cm: 460 samples
+  roll: >5deg with opposite PID sign: 428/460 samples
+  pitch: >5deg with opposite PID sign: 188/460 samples
+DShot DMA errors largest counter=0
+Battery/RPM data: not present in this telemetry version; cannot verify thrust.
+WARNING: persistent roll error despite opposing PID request. Check actual motor/prop torque or tether constraint BEFORE increasing gains.

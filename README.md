@@ -1,5 +1,8 @@
 # UAV DATN — STM32G474RE + ESP32-CAM (Direct Wi-Fi)
 
+> **Bản sửa thử nghiệm 05/11/2026 (sau thay gá IMU):** xem [`Document/PID_ZERO_PATCH_2026_11_05.md`](Document/PID_ZERO_PATCH_2026_11_05.md). Zero Roll/Pitch đã bù theo log đứng yên, `Angle Kp` mặc định thử 3,0 (trước 4,0); **cấu hình PID trong Flash có thể ghi đè mặc định**. Chưa build ARM/thử bay; không được mặc nhiên coi đây là firmware đã bay ổn định.
+
+
 > **Cập nhật: 05/11/2026 — cấu hình đang sử dụng trên UAV; Ground Station realtime đã thử nhận UDP và vẽ biểu đồ thành công.**  
 > Flight controller **NUCLEO-G474RE**, truyền telemetry và PID hai chiều đến **ESP32-CAM AI-Thinker** qua LPUART1 **PC1/PC0 (Arduino A4/A5)**. ESP32-CAM **phát Wi-Fi trực tiếp** `UAV-DIRECT-XXXXXX` tại `192.168.4.1`, không kết nối router. Ground Station nhận UDP tại cổng `14550`; dashboard realtime chạy **trên laptop** tại `http://127.0.0.1:8765`, không phải trên ESP32.
 >
@@ -367,3 +370,7 @@ Tài liệu nội bộ tham khảo: [`Document/FLIGHT_CANDIDATE_VI.md`](Document
 ---
 
 **Phạm vi cập nhật tài liệu:** README này mô tả cả dashboard realtime đã chạy trên laptop và những phép thử đã báo cáo; nó **không tự thay đổi** `.ioc`, HAL, ESP32 hoặc firmware đang chạy trên drone. Khi đồng bộ một project mới từ `UAV_DATN5.zip`, cần áp dụng patch UART A4/A5 và source Direct-AP Dashboard V2 riêng trước khi build.
+
+## Cập nhật PID thử trong lồng ngày 05/11/2026
+
+Xem `Document/PID_RATE_PI_CAGE_TEST_2026_11_05.md` trước khi nạp. Bản này bổ sung Rate I nhỏ, anti-windup, D-term theo dt và log chẩn đoán; Angle P / Rate P và toàn bộ chức năng điều khiển chính được giữ nguyên. Chú ý PID trong Flash có thể ghi đè mặc định. Đây chưa phải bản bay tự do được xác nhận ổn định.

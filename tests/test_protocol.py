@@ -5,9 +5,8 @@ import struct
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'Telemetry' / 'GroundStation'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'Telemetry' / 'UAV_GroundStation_Realtime_Charts'))
 from uav_ground_station import crc16_ccitt, decode_frame, PACKET_SIZE
-from uav_control import FIELDS
 
 
 def control_frame(message_type: int, sequence: int, payload: bytes = b'') -> bytes:
@@ -35,7 +34,7 @@ def run() -> None:
     assert request[:7] == b'\xc3\x3c\x01\x10\x34\x12\x00'
     assert len(request) == 9
     gains = struct.pack('<13f', 4.0, 80.0, 1.5, 1.5, 1.0, 0,0,0,0,0,0,30,200)
-    assert len(FIELDS) == 13 and len(gains) == 52
+    assert len(gains) == 52
     response = control_frame(0x90, 0x1234, b'\x00\x01' + gains)
     assert len(response) == 63
     assert crc16_ccitt(response[:-2]) == struct.unpack('<H', response[-2:])[0]

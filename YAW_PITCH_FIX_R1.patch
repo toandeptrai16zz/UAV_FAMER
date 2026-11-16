@@ -1,0 +1,220 @@
+--- a/Core/Src/uav_test.c
++++ b/Core/Src/uav_test.c
+@@ -419,13 +419,44 @@
+     /* dt-invariant complementary filter: 0.998 @ 1 ms, ~0.961 @ 20 ms
+      * when acc is trustworthy; accel influence is reduced on vibration. */
+     const float blend = (1.0f - expf(-dt / COMP_FILTER_TAU_S)) * confidence;
+-    const float predicted_roll = sensor_roll_angle + gyro_x_rate_dps() * dt;
+-    const float predicted_pitch = sensor_pitch_angle + gyro_y_rate_dps() * dt;
+-    sensor_roll_angle = predicted_roll + blend * (accel_roll - predicted_roll);
+-    sensor_pitch_angle = predicted_pitch + blend * (accel_pitch - predicted_pitch);
+-    /* Keep the existing calibrated physical axis map and mount trims. */
+-    roll_angle = -(sensor_pitch_angle - IMU_PITCH_MOUNT_TRIM_DEG);
+-    pitch_angle = -(sensor_roll_angle - IMU_ROLL_MOUNT_TRIM_DEG);
++    /* The old filter integrated IMU X/Y independently and ignored body yaw.
++     * That is not an Euler-attitude model: while yawing with nonzero roll,
++     * body-axis pitch rate and pitch Euler rate are DIFFERENT.  The 16-Nov
++     * log measured |yaw|>350 deg/s, so this omission is significant.
++     *
++     * Use the existing, field-checked frame convention:
++     *   roll  = pitch_mount_trim - sensor_pitch
++     *   pitch = roll_mount_trim  - sensor_roll
++     *   p/q/r = body_roll/pitch/yaw_rate_dps(), with +yaw clockwise.
++     * Integrate rigid-body 3-2-1 Euler kinematics in the AIRFRAME axes,
++     * then blend with the existing acceleration-based level reference.
++     * No MPU6500 axis/trim calibration or external telemetry sign changes.
++     * Attitude is used only inside the guarded existing control loop.
++     */
++    const float rad = 0.01745329251994329577f;
++    const float old_roll = IMU_PITCH_MOUNT_TRIM_DEG - sensor_pitch_angle;
++    const float old_pitch = IMU_ROLL_MOUNT_TRIM_DEG - sensor_roll_angle;
++    const float phi = old_roll * rad;
++    const float theta = old_pitch * rad;
++    const float p = body_roll_rate_dps();
++    const float q = body_pitch_rate_dps();
++    const float r = body_yaw_rate_dps();
++    /* Keep tan(theta) bounded if tilt approaches the Euler singularity.
++     * Normal arming already requires <8 degrees of tilt. */
++    const float bounded_pitch = fmaxf(-1.3962634f, fminf(1.3962634f, theta));
++    const float sin_phi = sinf(phi), cos_phi = cosf(phi);
++    const float roll_dot = p + (q * sin_phi + r * cos_phi) * tanf(bounded_pitch);
++    const float pitch_dot = q * cos_phi - r * sin_phi;
++    const float predicted_body_roll = old_roll + roll_dot * dt;
++    const float predicted_body_pitch = old_pitch + pitch_dot * dt;
++    const float acc_body_roll = IMU_PITCH_MOUNT_TRIM_DEG - accel_pitch;
++    const float acc_body_pitch = IMU_ROLL_MOUNT_TRIM_DEG - accel_roll;
++    roll_angle = predicted_body_roll + blend * (acc_body_roll - predicted_body_roll);
++    pitch_angle = predicted_body_pitch + blend * (acc_body_pitch - predicted_body_pitch);
++    /* Preserve sensor-angle semantics for the existing ASCII diagnostics. */
++    sensor_pitch_angle = IMU_PITCH_MOUNT_TRIM_DEG - roll_angle;
++    sensor_roll_angle = IMU_ROLL_MOUNT_TRIM_DEG - pitch_angle;
++    /* Non-finite attitude must still trigger the original motor failsafe. */
+ }
+ 
+ #if ENABLE_ATTITUDE_PID
+@@ -819,6 +850,7 @@
+                      * Integrate ONLY near level, neutral RC, moderate gyro,
+                      * with the motors already spinning. Never wind against
+                      * the cage/tether or a strong transient. */
++                    .reset_integrator = !armed || !spinning,
+                     .allow_integrator = armed && spinning &&
+                         (fabsf(roll_angle) < 6.0f) &&
+                         (fabsf(pitch_angle) < 6.0f) &&
+--- a/Core/Src/flight_pid.c
++++ b/Core/Src/flight_pid.c
+@@ -1,8 +1,8 @@
+ /* Cascaded angle -> rate controller. 2026-11-05 lab/cage trial profile.
+  * The observed 11+ deg sustained roll error needs motor/axis verification;
+  * controller changes alone cannot establish stability. The small I term is
+- * active only while NEAR LEVEL, neutral sticks and with real motor output,
+- * to avoid winding up when the cage/tethers constrain rotation.
++ * updated only while NEAR LEVEL, neutral sticks and with real motor output,
++ * and frozen during transients to avoid winding against cage/tethers.
+  * D remains OFF until high-rate gyro noise is logged. */
+ #include "flight_pid.h"
+ #include <math.h>
+@@ -83,10 +83,32 @@
+     }
+     if (in->dt_s <= 0.0f || in->dt_s > 0.020f) { FlightPID_Reset(s); return false; }
+     const float gyro[] = {in->gyro_roll_dps, in->gyro_pitch_dps, in->gyro_yaw_dps};
++    /* Angle loop sets EULER angle rates; gyro measures BODY angular rates.
++     * With yaw motion and tilted airframe they are not interchangeable.
++     * Convert requested Euler roll/pitch rates to body p/q using the
++     * measured yaw rate for attitude-hold decoupling.  The same 3-2-1
++     * convention is used by update_attitude(). Roll positive right-down,
++     * pitch positive nose-up and yaw positive CW when viewed from above.
++     *
++     * theta_dot = q*cos(phi) - r*sin(phi)
++     * phi_dot   = p + (q*sin(phi)+r*cos(phi))*tan(theta)
++     * No separate yaw angle hold: yaw still tracks stick-rate input.
++     */
++    const float rad = 0.01745329251994329577f;
++    const float phi = in->roll_deg * rad;
++    const float theta = fmaxf(-1.3962634f, fminf(1.3962634f, in->pitch_deg * rad));
++    const float cos_phi = cosf(phi);
++    const float cos_phi_safe = (fabsf(cos_phi) < 0.174f) ?
++        (cos_phi < 0.0f ? -0.174f : 0.174f) : cos_phi;
++    const float phi_dot = limit(active_gains.angle_kp * (in->roll_set_deg-in->roll_deg),active_gains.max_rate_dps);
++    const float theta_dot = limit(active_gains.angle_kp * (in->pitch_set_deg-in->pitch_deg),active_gains.max_rate_dps);
++    const float r = in->gyro_yaw_dps;
++    const float q_target = (theta_dot + r * sinf(phi)) / cos_phi_safe;
++    const float p_target = phi_dot - (q_target * sinf(phi) + r * cos_phi) * tanf(theta);
+     const float target[] = {
+-        limit(active_gains.angle_kp*(in->roll_set_deg-in->roll_deg),active_gains.max_rate_dps),
+-        limit(active_gains.angle_kp*(in->pitch_set_deg-in->pitch_deg),active_gains.max_rate_dps),
+-        limit(in->yaw_rate_set_dps,active_gains.max_rate_dps)
++        limit(p_target, active_gains.max_rate_dps),
++        limit(q_target, active_gains.max_rate_dps),
++        limit(in->yaw_rate_set_dps, active_gains.max_rate_dps)
+     };
+     const float *kp = active_gains.rate_kp;
+     float u[3];
+@@ -97,7 +119,9 @@
+         s->gyro_deriv_filt[i] += d_alpha * (derivative - s->gyro_deriv_filt[i]);
+         const float p_term = kp[i] * error;
+         const float d_term = -active_gains.rate_kd[i] * s->gyro_deriv_filt[i];
+-        if (in->allow_integrator && active_gains.rate_ki[i] > 0.0f) {
++        if (in->reset_integrator) {
++            s->integrator[i] = 0.0f;
++        } else if (in->allow_integrator && active_gains.rate_ki[i] > 0.0f) {
+             const float candidate_i = limit(s->integrator[i] + error * in->dt_s,
+                                             active_gains.integral_limit);
+             const float candidate_u = p_term + active_gains.rate_ki[i] * candidate_i + d_term;
+@@ -108,9 +132,9 @@
+                 s->integrator[i] = candidate_i;
+             }
+         } else {
+-            /* Cage constraints, motor-off and changing pilot sticks must not
+-             * leave a stored bias for the next takeoff. */
+-            s->integrator[i] = 0.0f;
++            /* Brief fast yaw/tilt transients freeze rather than ERASE the
++             * bounded I bias.  Motor-off resets it above and ARM/disarm
++             * still runs FlightPID_Reset.  Do not integrate against tethers. */
+         }
+         const float i_term = active_gains.rate_ki[i] * s->integrator[i];
+         u[i] = limit(p_term + i_term + d_term, active_gains.correction_limit);
+--- a/Core/Inc/flight_pid.h
++++ b/Core/Inc/flight_pid.h
+@@ -36,6 +36,8 @@
+     float gyro_roll_dps, gyro_pitch_dps, gyro_yaw_dps;
+     float dt_s;
+     bool allow_integrator;
++    /* Reset when motor output is off; otherwise hold I during transients. */
++    bool reset_integrator;
+ } FlightPIDInput;
+ 
+ typedef struct { float roll, pitch, yaw; } FlightPIDOutput;
+--- a/tests/test_flight.c
++++ b/tests/test_flight.c
+@@ -210,13 +210,17 @@
+  assert(fabsf(state.pid_i[0]+6.0f)<0.001f);
+  assert(fabsf(state.rate_set_dps[0]+6.0f)<0.001f);
+  assert(fabsf(state.rate_error_dps[0]+6.0f)<0.001f);
+- /* Disarmed/actively maneuvering gate revokes integrator immediately. */
++ /* Fast transient must freeze the bias instead of deleting it. */
+  in.allow_integrator=false; assert(FlightPID_Step(&state,&in,&o));
++ assert(state.integrator[0] < -29.9f && fabsf(state.pid_i[0]+6.0f)<0.01f);
++ /* Motor-off condition explicitly resets the stored correction. */
++ in.reset_integrator=true; assert(FlightPID_Step(&state,&in,&o));
+  assert(state.integrator[0]==0.0f && state.pid_i[0]==0.0f);
++ in.reset_integrator=false;
+  in.allow_integrator=true; in.roll_deg=0.0f;
+  FlightPID_Reset(&state); assert(FlightPID_Step(&state,&in,&o));
+  assert(fabsf(o.roll)<0.001f);
+- puts("PASS tiny bounded near-level I, setpoint/error telemetry and gate reset");
++ puts("PASS tiny bounded near-level I, setpoint/error telemetry, freeze and motor-off reset");
+ }
+ static void test_rate_saturation_and_derivative_dt(void){
+  FlightPIDGains baseline,g; FlightPID_DefaultGains(&baseline);
+@@ -250,6 +254,51 @@
+  assert(FlightPID_SetGains(&baseline));
+  puts("PASS saturation antiwindup and dt-invariant D lowpass");
+ }
++
++static void test_yaw_coupled_attitude(void){
++ /* At 10 deg roll and 8 deg pitch, a +120 dps BODY yaw causes nonzero
++  * Euler roll/pitch rate even when body p/q are zero.  Refuse gravity
++  * correction for this synthetic sample; integrate exactly one 10ms tick. */
++ const float rad=0.01745329251994329577f;
++ const float initial_roll=10.0f, initial_pitch=8.0f, yaw=120.0f;
++ accel_x=0;accel_y=0;accel_z=15000; /* |a|>1.3g -> reject accel */
++ gyro_bias_x_raw=gyro_bias_y_raw=gyro_bias_z_raw=0;
++ gyro_x=gyro_y=0;gyro_z=(int16_t)(-yaw*GYRO_LSB_PER_DPS);
++ attitude_initialized=true;
++ sensor_pitch_angle=IMU_PITCH_MOUNT_TRIM_DEG-initial_roll;
++ sensor_roll_angle=IMU_ROLL_MOUNT_TRIM_DEG-initial_pitch;
++ const float expected_roll=initial_roll + yaw*cosf(initial_roll*rad)*tanf(initial_pitch*rad)*0.010f;
++ const float expected_pitch=initial_pitch - yaw*sinf(initial_roll*rad)*0.010f;
++ update_attitude(10);
++ assert(fabsf(roll_angle-expected_roll)<0.001f);
++ assert(fabsf(pitch_angle-expected_pitch)<0.001f);
++ assert(fabsf(sensor_pitch_angle-(IMU_PITCH_MOUNT_TRIM_DEG-roll_angle))<0.0001f);
++ assert(fabsf(sensor_roll_angle-(IMU_ROLL_MOUNT_TRIM_DEG-pitch_angle))<0.0001f);
++ puts("PASS yaw-coupled 3D attitude propagation and legacy sensor-axis mapping");
++}
++static void test_yaw_coupled_rate_setpoints(void){
++ FlightPIDGains baseline;FlightPID_DefaultGains(&baseline);
++ assert(FlightPID_SetGains(&baseline));
++ FlightPIDState state={0};FlightPIDInput in={0};FlightPIDOutput out={0};
++ in.dt_s=0.001f;in.roll_deg=10.0f;in.pitch_deg=8.0f;in.gyro_yaw_dps=120.0f;
++ assert(FlightPID_Step(&state,&in,&out));
++ const float phi=in.roll_deg*0.01745329251994329577f;
++ const float theta=in.pitch_deg*0.01745329251994329577f;
++ const float phi_dot=-baseline.angle_kp*in.roll_deg;
++ const float theta_dot=-baseline.angle_kp*in.pitch_deg;
++ const float q=(theta_dot+in.gyro_yaw_dps*sinf(phi))/cosf(phi);
++ const float p=phi_dot-(q*sinf(phi)+in.gyro_yaw_dps*cosf(phi))*tanf(theta);
++ assert(fabsf(state.rate_set_dps[0]-p)<0.01f);
++ assert(fabsf(state.rate_set_dps[1]-q)<0.01f);
++ assert(fabsf(state.rate_set_dps[2])<0.01f);
++ /* With zero yaw and a level airframe, retain legacy rate setpoints. */
++ in.roll_deg=0;in.pitch_deg=0;in.gyro_yaw_dps=0;
++ assert(FlightPID_Step(&state,&in,&out));
++ assert(fabsf(state.rate_set_dps[0])<0.001f);
++ assert(fabsf(state.rate_set_dps[1])<0.001f);
++ puts("PASS yaw-coupled Euler-target to body-rate mapping and level regression");
++}
+ int main(void){
++ test_yaw_coupled_attitude(); test_yaw_coupled_rate_setpoints();
+  test_rate_integral_near_level(); test_rate_saturation_and_derivative_dt();
+  test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_acceleration_rejection();test_mixer();return 0;}

@@ -1,0 +1,252 @@
+--- a/UAV_DATN/Core/Src/flight_pid.c
++++ b/UAV_DATN/Core/Src/flight_pid.c
+@@ -1,26 +1,27 @@
+-/* Initial cascaded attitude/rate controller for FLIGHT CANDIDATE.
+- * ANGLE_KP and RATE_KP are provisional. RATE_KI and RATE_KD intentionally
+- * remain zero until real gyro noise, motor response and airframe dynamics are
+- * measured. This is not a validated/tuned flight PID. */
++/* Cascaded angle -> rate controller. 2026-11-05 lab/cage trial profile.
++ * The observed 11+ deg sustained roll error needs motor/axis verification;
++ * controller changes alone cannot establish stability. The small I term is
++ * active only while NEAR LEVEL, neutral sticks and with real motor output,
++ * to avoid winding up when the cage/tethers constrain rotation.
++ * D remains OFF until high-rate gyro noise is logged. */
+ #include "flight_pid.h"
+ #include <math.h>
+ #include <stddef.h>
+ 
+-/* Diagnostic tuning profile 2026-11-05: reduce ONLY the outer angle P
+- * 4.0 -> 3.0 (-25%). Inner rate P and yaw, I/D remain unchanged.
+- * This is a bounded test starting point, NOT a certified stable flight tune.
+- * Saved Flash gains are loaded later by UAVConfig_Init and take precedence. */
++/* Distinct controlled experiment: preserve verified Angle P=3.0, Rate P,
++ * add SMALL bounded I (max 6 / 6 / 3 DShot) only within near-level gate.
++ * Saved Flash gains loaded by UAVConfig_Init take precedence. */
+ static const FlightPIDGains default_gains = {
+     .angle_kp = 3.0f, .max_rate_dps = 80.0f,
+     .rate_kp = {1.5f, 1.5f, 1.0f},
+-    .rate_ki = {0.0f, 0.0f, 0.0f},
++    .rate_ki = {0.20f, 0.20f, 0.10f},
+     .rate_kd = {0.0f, 0.0f, 0.0f},
+     .integral_limit = 30.0f, .correction_limit = 200.0f
+ };
+ static FlightPIDGains active_gains = {
+     .angle_kp = 3.0f, .max_rate_dps = 80.0f,
+     .rate_kp = {1.5f, 1.5f, 1.0f},
+-    .rate_ki = {0.0f, 0.0f, 0.0f},
++    .rate_ki = {0.20f, 0.20f, 0.10f},
+     .rate_kd = {0.0f, 0.0f, 0.0f},
+     .integral_limit = 30.0f, .correction_limit = 200.0f
+ };
+@@ -47,6 +48,12 @@
+     return true;
+ }
+ 
++/* Recalculate D-only low-pass per real dt (not fixed alpha per iteration).
++ * A first-order 25 Hz cutoff limits differentiator noise. D is OFF by
++ * default; this ensures future D tuning does not depend on timing jitter. */
++#define PID_DTERM_LPF_HZ 25.0f
++#define PID_TAU_TWO_PI 6.283185307179586f
++
+ static float limit(float x, float bound) {
+     return x > bound ? bound : (x < -bound ? -bound : x);
+ }
+@@ -57,6 +64,11 @@
+         s->integrator[i]=0.0f;
+         s->gyro_prev[i]=0.0f;
+         s->gyro_deriv_filt[i]=0.0f;
++        s->rate_set_dps[i]=0.0f;
++        s->rate_error_dps[i]=0.0f;
++        s->pid_p[i]=0.0f;
++        s->pid_i[i]=0.0f;
++        s->pid_d[i]=0.0f;
+     }
+     s->has_prev=false;
+ }
+@@ -79,17 +91,35 @@
+     const float *kp = active_gains.rate_kp;
+     float u[3];
+     for (unsigned i=0;i<3;++i) {
+-        float error=target[i]-gyro[i];
+-        float derivative=0.0f;
+-        if (s->has_prev) derivative=(gyro[i]-s->gyro_prev[i])/in->dt_s;
+-        s->gyro_deriv_filt[i] = 0.2f*derivative + 0.8f*s->gyro_deriv_filt[i];
+-        float candidate_i = limit(s->integrator[i]+error*in->dt_s,active_gains.integral_limit);
+-        float unconstrained=kp[i]*error+active_gains.rate_ki[i]*candidate_i-active_gains.rate_kd[i]*s->gyro_deriv_filt[i];
+-        if (in->allow_integrator && fabsf(unconstrained) < active_gains.correction_limit) {
+-            s->integrator[i] = candidate_i;
+-        } else if (!in->allow_integrator) s->integrator[i] = 0.0f;
+-        u[i]=limit(kp[i]*error+active_gains.rate_ki[i]*s->integrator[i]-active_gains.rate_kd[i]*s->gyro_deriv_filt[i],active_gains.correction_limit);
+-        s->gyro_prev[i]=gyro[i];
++        const float error = target[i] - gyro[i];
++        const float d_alpha = 1.0f - expf(-PID_TAU_TWO_PI * PID_DTERM_LPF_HZ * in->dt_s);
++        const float derivative = s->has_prev ? (gyro[i] - s->gyro_prev[i]) / in->dt_s : 0.0f;
++        s->gyro_deriv_filt[i] += d_alpha * (derivative - s->gyro_deriv_filt[i]);
++        const float p_term = kp[i] * error;
++        const float d_term = -active_gains.rate_kd[i] * s->gyro_deriv_filt[i];
++        if (in->allow_integrator && active_gains.rate_ki[i] > 0.0f) {
++            const float candidate_i = limit(s->integrator[i] + error * in->dt_s,
++                                            active_gains.integral_limit);
++            const float candidate_u = p_term + active_gains.rate_ki[i] * candidate_i + d_term;
++            /* Conditional integration: a saturated axis may ONLY unwind.
++             * The old fabs(unconstrained) check froze recovery on the rail. */
++            if ((candidate_u < active_gains.correction_limit || error < 0.0f) &&
++                (candidate_u > -active_gains.correction_limit || error > 0.0f)) {
++                s->integrator[i] = candidate_i;
++            }
++        } else {
++            /* Cage constraints, motor-off and changing pilot sticks must not
++             * leave a stored bias for the next takeoff. */
++            s->integrator[i] = 0.0f;
++        }
++        const float i_term = active_gains.rate_ki[i] * s->integrator[i];
++        u[i] = limit(p_term + i_term + d_term, active_gains.correction_limit);
++        s->rate_set_dps[i] = target[i];
++        s->rate_error_dps[i] = error;
++        s->pid_p[i] = p_term;
++        s->pid_i[i] = i_term;
++        s->pid_d[i] = d_term;
++        s->gyro_prev[i] = gyro[i];
+     }
+     s->has_prev=true;
+     out->roll=u[0]; out->pitch=u[1]; out->yaw=u[2];
+
+--- a/UAV_DATN/Core/Inc/flight_pid.h
++++ b/UAV_DATN/Core/Inc/flight_pid.h
+@@ -24,6 +24,9 @@
+     float integrator[3];
+     float gyro_prev[3];
+     float gyro_deriv_filt[3];
++    /* Diagnostics only, no change to the 52-byte configuration protocol. */
++    float rate_set_dps[3], rate_error_dps[3];
++    float pid_p[3], pid_i[3], pid_d[3];
+     bool has_prev;
+ } FlightPIDState;
+ 
+
+--- a/UAV_DATN/Core/Src/uav_test.c
++++ b/UAV_DATN/Core/Src/uav_test.c
+@@ -815,7 +815,19 @@
+                      * Preserve V328 manually observed negative sensor-Z sign. */
+                     .gyro_yaw_dps = body_yaw_rate_dps(),
+                     .dt_s = (float)dt_ms/1000.0f,
+-                    .allow_integrator = armed && spinning
++                    /* A restraint can hold the craft at a false steady angle.
++                     * Integrate ONLY near level, neutral RC, moderate gyro,
++                     * with the motors already spinning. Never wind against
++                     * the cage/tether or a strong transient. */
++                    .allow_integrator = armed && spinning &&
++                        (fabsf(roll_angle) < 6.0f) &&
++                        (fabsf(pitch_angle) < 6.0f) &&
++                        (fabsf(body_roll_rate_dps()) < 35.0f) &&
++                        (fabsf(body_pitch_rate_dps()) < 35.0f) &&
++                        (fabsf(body_yaw_rate_dps()) < 35.0f) &&
++                        (fabsf(RC_StickNormalized(channels[CH_ROLL], RC_ROLL_CENTER)) < 0.02f) &&
++                        (fabsf(RC_StickNormalized(channels[CH_PITCH], RC_PITCH_CENTER)) < 0.02f) &&
++                        (fabsf(RC_StickNormalized(channels[CH_YAW], RC_YAW_CENTER)) < 0.02f)
+                 };
+                 FlightPIDOutput out;
+                 if (FlightPID_Step(&flight_pid, &in, &out)) {
+@@ -1306,7 +1318,7 @@
+          * Flags 0x04/0x08 and timeout remain independently visible. */
+         const uint8_t fs_guard = debug_rf_latched ? debug_rf_guard_reason : fs_reason;
+         last_log_ms = now;
+-        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu TLM=%lu TLD=%lu\r\n",
++        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu TLM=%lu TLD=%lu RT=%ld/%ld/%ld RE=%ld/%ld/%ld IT=%ld/%ld/%ld\r\n",
+                   (unsigned long)(++log_sequence),
+                   rx_fresh ? 1u : 0u, debug_link_ok ? 1u : 0u,
+                   (unsigned)fs_guard, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
+@@ -1347,7 +1359,16 @@
+                   (unsigned long)motor_late_count, (unsigned long)imu_gap_count,
+                   (unsigned long)imu_read_errors,
+                   (unsigned long)UAVTelemetry_GetCompleted(),
+-                  (unsigned long)UAVTelemetry_GetDropped());
++                  (unsigned long)UAVTelemetry_GetDropped(),
++                  (long)(flight_pid.rate_set_dps[0] * 10.0f),
++                  (long)(flight_pid.rate_set_dps[1] * 10.0f),
++                  (long)(flight_pid.rate_set_dps[2] * 10.0f),
++                  (long)(flight_pid.rate_error_dps[0] * 10.0f),
++                  (long)(flight_pid.rate_error_dps[1] * 10.0f),
++                  (long)(flight_pid.rate_error_dps[2] * 10.0f),
++                  (long)(flight_pid.pid_i[0] * 10.0f),
++                  (long)(flight_pid.pid_i[1] * 10.0f),
++                  (long)(flight_pid.pid_i[2] * 10.0f));
+     }
+ 
+     /* Binary telemetry follows the 1 Hz ASCII status write on the same UART.
+
+--- a/UAV_DATN/tests/test_flight.c
++++ b/UAV_DATN/tests/test_flight.c
+@@ -195,5 +195,61 @@
+     update_attitude(1u);assert(!attitude_initialized);
+     puts("PASS acceleration norm rejection, slow gravity convergence, safe initialization");
+ }
++static void test_rate_integral_near_level(void){
++ FlightPIDState state={0}; FlightPIDInput in={0}; FlightPIDOutput o={0};
++ FlightPIDGains g; FlightPID_DefaultGains(&g);
++ assert(fabsf(g.rate_ki[0]-0.20f)<0.0001f);
++ assert(fabsf(g.rate_ki[1]-0.20f)<0.0001f);
++ assert(fabsf(g.rate_ki[2]-0.10f)<0.0001f);
++ assert(fabsf(g.angle_kp-3.0f)<0.0001f);
++ assert(FlightPID_SetGains(&g));
++ in.dt_s=.001f; in.roll_deg=2.0f; in.allow_integrator=true;
++ FlightPID_Reset(&state);
++ for(int i=0;i<15000;i++) assert(FlightPID_Step(&state,&in,&o));
++ assert(state.integrator[0] < -29.9f && state.integrator[0] >= -30.0f);
++ assert(fabsf(state.pid_i[0]+6.0f)<0.001f);
++ assert(fabsf(state.rate_set_dps[0]+6.0f)<0.001f);
++ assert(fabsf(state.rate_error_dps[0]+6.0f)<0.001f);
++ /* Disarmed/actively maneuvering gate revokes integrator immediately. */
++ in.allow_integrator=false; assert(FlightPID_Step(&state,&in,&o));
++ assert(state.integrator[0]==0.0f && state.pid_i[0]==0.0f);
++ in.allow_integrator=true; in.roll_deg=0.0f;
++ FlightPID_Reset(&state); assert(FlightPID_Step(&state,&in,&o));
++ assert(fabsf(o.roll)<0.001f);
++ puts("PASS tiny bounded near-level I, setpoint/error telemetry and gate reset");
++}
++static void test_rate_saturation_and_derivative_dt(void){
++ FlightPIDGains baseline,g; FlightPID_DefaultGains(&baseline);
++ g=baseline; g.rate_kp[0]=3.0f;g.rate_ki[0]=1.0f;g.rate_kd[0]=0.0f;
++ assert(FlightPID_SetGains(&g));
++ FlightPIDState s={0};FlightPIDInput in={0};FlightPIDOutput out={0};
++ FlightPID_Reset(&s);in.dt_s=.001f;in.allow_integrator=true;
++ in.gyro_roll_dps=-200.0f;
++ for(int j=0;j<1000;j++)assert(FlightPID_Step(&s,&in,&out));
++ assert(s.integrator[0]==0.0f && out.roll==g.correction_limit);
++ in.gyro_roll_dps=0.0f;in.roll_deg=2.0f;
++ for(int j=0;j<10;j++)assert(FlightPID_Step(&s,&in,&out));
++ assert(s.integrator[0]<0.0f);
++ FlightPID_Reset(&s);
++ assert(s.integrator[0]==0.0f && !s.has_prev);
++ /* D-path timing invariance for a linearly increasing gyro, 1 kHz vs 500 Hz. */
++ g=baseline;g.rate_kd[0]=0.01f;g.rate_kp[0]=0.0f;g.rate_ki[0]=0.0f;
++ assert(FlightPID_SetGains(&g));
++ FlightPIDState a={0},b={0};FlightPIDOutput oa={0},ob={0};
++ FlightPIDInput x={0},y={0};x.dt_s=.001f;y.dt_s=.002f;
++ for(int i=0;i<1000;i++){
++   x.gyro_roll_dps=(float)i*0.1f;
++   assert(FlightPID_Step(&a,&x,&oa));
++ }
++ for(int i=0;i<500;i++){
++   y.gyro_roll_dps=(float)i*0.2f;
++   assert(FlightPID_Step(&b,&y,&ob));
++ }
++ assert(fabsf(a.gyro_deriv_filt[0]-b.gyro_deriv_filt[0])<1.0f);
++ assert(fabsf(a.gyro_deriv_filt[0]-100.0f)<2.0f);
++ assert(FlightPID_SetGains(&baseline));
++ puts("PASS saturation antiwindup and dt-invariant D lowpass");
++}
+ int main(void){
++ test_rate_integral_near_level(); test_rate_saturation_and_derivative_dt();
+  test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_acceleration_rejection();test_mixer();return 0;}
+
+--- a/UAV_DATN/README.md
++++ b/UAV_DATN/README.md
+@@ -370,3 +370,7 @@
+ ---
+ 
+ **Phạm vi cập nhật tài liệu:** README này mô tả cả dashboard realtime đã chạy trên laptop và những phép thử đã báo cáo; nó **không tự thay đổi** `.ioc`, HAL, ESP32 hoặc firmware đang chạy trên drone. Khi đồng bộ một project mới từ `UAV_DATN5.zip`, cần áp dụng patch UART A4/A5 và source Direct-AP Dashboard V2 riêng trước khi build.
++
++## Cập nhật PID thử trong lồng ngày 05/11/2026
++
++Xem `Document/PID_RATE_PI_CAGE_TEST_2026_11_05.md` trước khi nạp. Bản này bổ sung Rate I nhỏ, anti-windup, D-term theo dt và log chẩn đoán; Angle P / Rate P và toàn bộ chức năng điều khiển chính được giữ nguyên. Chú ý PID trong Flash có thể ghi đè mặc định. Đây chưa phải bản bay tự do được xác nhận ổn định.

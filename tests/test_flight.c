@@ -11,7 +11,6 @@ TIM_HandleTypeDef htim3={&timer};
 SPI_HandleTypeDef hspi2;
 DMA_HandleTypeDef hdma_tim3_up;
 I2C_HandleTypeDef hi2c1;
-<<<<<<< HEAD
 /* UART bridge mocks: independent protocol module is tested separately. */
 void UAVTelemetry_Reset(void) {}
 bool UAVTelemetry_Send(UART_HandleTypeDef *u, const UAVTelemetrySample *s) {(void)u;(void)s;return true;}
@@ -25,8 +24,6 @@ void UAVConfig_OnTxComplete(UART_HandleTypeDef *u) {(void)u;}
 void UAVConfig_OnError(UART_HandleTypeDef *u) {(void)u;}
 void UAVConfig_Service(bool safe) {(void)safe;}
 void UAVConfig_ServiceBoot(bool safe) {(void)safe;}
-=======
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
 uint32_t HAL_GetTick(void){return tick;}
 void HAL_Delay(uint32_t x){tick+=x;}
 void HAL_GPIO_WritePin(int p,int n,int v){(void)p;(void)n;(void)v;}
@@ -136,7 +133,6 @@ static void test_protocol(void){
  assert(sbus_flags==8);
  puts("PASS all DShot payloads/CRC, SBUS 16-channel decode, RC neutral/low throttle");
 }
-<<<<<<< HEAD
 static void test_config_mode(void){
  setup();sbus_channels[CH_CONFIG]=1800;sbus_channels[CH_KILL]=1800;step();
  assert(uav_config_allowed && !armed && !spinning);
@@ -149,18 +145,111 @@ static void test_config_mode(void){
  sbus_channels[CH_CONFIG]=1800;step();assert(armed && !uav_config_allowed); /* no midflight disarm */
  puts("PASS physical CH8 config gate, ARM lock, no midflight CH8 disarm");
 }
+static void test_20261105_ground_log_zero(void) {
+ /* Known-level hypothesis from 2,283 stationary samples. Account for the
+  * crossed sensor/airframe axis mapping, not the raw accel tilt names. */
+ const float log_roll_mean = -1.2988f, log_pitch_mean = -2.81026f;
+ const float corrected_roll = log_roll_mean + (IMU_PITCH_MOUNT_TRIM_DEG - (-1.06f));
+ const float corrected_pitch = log_pitch_mean + (IMU_ROLL_MOUNT_TRIM_DEG - (-2.13f));
+ assert(fabsf(corrected_roll) < 0.02f);
+ assert(fabsf(corrected_pitch) < 0.02f);
+ FlightPIDState state={0}; FlightPIDOutput o={0};
+ FlightPIDInput in={0};
+ in.roll_deg=corrected_roll;in.pitch_deg=corrected_pitch;
+ in.gyro_roll_dps=-0.26636f;in.gyro_pitch_dps=0.06075f;
+ in.gyro_yaw_dps=0.01297f;in.dt_s=0.001f;
+ FlightPID_Reset(&state);
+ assert(FlightPID_Step(&state,&in,&o));
+ assert(fabsf(o.roll) < 1.0f && fabsf(o.pitch) < 1.0f && fabsf(o.yaw) < 1.0f);
+ puts("PASS static zero correction & small stationary PID for remounted IMU");
+}
 static void test_runtime_gains(void){
  FlightPIDGains baseline,g;
  FlightPID_DefaultGains(&baseline); FlightPID_GetGains(&g);
- assert(fabsf(g.rate_kp[0]-1.5f)<0.001f && fabsf(g.angle_kp-4.0f)<0.001f);
+ assert(fabsf(g.rate_kp[0]-1.5f)<0.001f && fabsf(g.angle_kp-3.0f)<0.001f);
  g.rate_kp[0] = 1.2f; assert(FlightPID_SetGains(&g));
  g.rate_ki[1] = NAN; assert(!FlightPID_SetGains(&g));
  FlightPID_GetGains(&g); assert(fabsf(g.rate_kp[0]-1.2f)<0.001f);
  assert(FlightPID_SetGains(&baseline));
  puts("PASS runtime PID defaults, bounds, NAN rejection, atomic apply");
 }
+static void test_acceleration_rejection(void){
+    gyro_x=gyro_y=gyro_z=0;
+    gyro_bias_x_raw=gyro_bias_y_raw=gyro_bias_z_raw=0;
+    attitude_initialized=true;
+    sensor_roll_angle=0.0f;sensor_pitch_angle=0.0f;
+    /* 1.5g/30deg acceleration: must not be interpreted as tilt. */
+    accel_x=0;accel_y=6144;accel_z=10642;
+    assert(accel_tilt_confidence((float)accel_x,(float)accel_y,(float)accel_z)<0.001f);
+    for (unsigned i=0;i<100;i++)update_attitude(1u);
+    assert(fabsf(sensor_roll_angle)<0.001f);
+    /* Real gravity-only 30-degree lean should converge without a 50ms snap. */
+    accel_y=4096;accel_z=7094;
+    assert(accel_tilt_confidence((float)accel_x,(float)accel_y,(float)accel_z)>0.99f);
+    update_attitude(1u);
+    assert(sensor_roll_angle>0.04f && sensor_roll_angle<0.10f);
+    for (unsigned i=0;i<1000;i++)update_attitude(1u);
+    assert(sensor_roll_angle>25.0f && sensor_roll_angle<30.5f);
+    /* Invalid acceleration should not initialize attitude at boot. */
+    attitude_initialized=false;accel_y=0;accel_z=15000;
+    update_attitude(1u);assert(!attitude_initialized);
+    puts("PASS acceleration norm rejection, slow gravity convergence, safe initialization");
+}
+static void test_rate_integral_near_level(void){
+ FlightPIDState state={0}; FlightPIDInput in={0}; FlightPIDOutput o={0};
+ FlightPIDGains g; FlightPID_DefaultGains(&g);
+ assert(fabsf(g.rate_ki[0]-0.20f)<0.0001f);
+ assert(fabsf(g.rate_ki[1]-0.20f)<0.0001f);
+ assert(fabsf(g.rate_ki[2]-0.10f)<0.0001f);
+ assert(fabsf(g.angle_kp-3.0f)<0.0001f);
+ assert(FlightPID_SetGains(&g));
+ in.dt_s=.001f; in.roll_deg=2.0f; in.allow_integrator=true;
+ FlightPID_Reset(&state);
+ for(int i=0;i<15000;i++) assert(FlightPID_Step(&state,&in,&o));
+ assert(state.integrator[0] < -29.9f && state.integrator[0] >= -30.0f);
+ assert(fabsf(state.pid_i[0]+6.0f)<0.001f);
+ assert(fabsf(state.rate_set_dps[0]+6.0f)<0.001f);
+ assert(fabsf(state.rate_error_dps[0]+6.0f)<0.001f);
+ /* Disarmed/actively maneuvering gate revokes integrator immediately. */
+ in.allow_integrator=false; assert(FlightPID_Step(&state,&in,&o));
+ assert(state.integrator[0]==0.0f && state.pid_i[0]==0.0f);
+ in.allow_integrator=true; in.roll_deg=0.0f;
+ FlightPID_Reset(&state); assert(FlightPID_Step(&state,&in,&o));
+ assert(fabsf(o.roll)<0.001f);
+ puts("PASS tiny bounded near-level I, setpoint/error telemetry and gate reset");
+}
+static void test_rate_saturation_and_derivative_dt(void){
+ FlightPIDGains baseline,g; FlightPID_DefaultGains(&baseline);
+ g=baseline; g.rate_kp[0]=3.0f;g.rate_ki[0]=1.0f;g.rate_kd[0]=0.0f;
+ assert(FlightPID_SetGains(&g));
+ FlightPIDState s={0};FlightPIDInput in={0};FlightPIDOutput out={0};
+ FlightPID_Reset(&s);in.dt_s=.001f;in.allow_integrator=true;
+ in.gyro_roll_dps=-200.0f;
+ for(int j=0;j<1000;j++)assert(FlightPID_Step(&s,&in,&out));
+ assert(s.integrator[0]==0.0f && out.roll==g.correction_limit);
+ in.gyro_roll_dps=0.0f;in.roll_deg=2.0f;
+ for(int j=0;j<10;j++)assert(FlightPID_Step(&s,&in,&out));
+ assert(s.integrator[0]<0.0f);
+ FlightPID_Reset(&s);
+ assert(s.integrator[0]==0.0f && !s.has_prev);
+ /* D-path timing invariance for a linearly increasing gyro, 1 kHz vs 500 Hz. */
+ g=baseline;g.rate_kd[0]=0.01f;g.rate_kp[0]=0.0f;g.rate_ki[0]=0.0f;
+ assert(FlightPID_SetGains(&g));
+ FlightPIDState a={0},b={0};FlightPIDOutput oa={0},ob={0};
+ FlightPIDInput x={0},y={0};x.dt_s=.001f;y.dt_s=.002f;
+ for(int i=0;i<1000;i++){
+   x.gyro_roll_dps=(float)i*0.1f;
+   assert(FlightPID_Step(&a,&x,&oa));
+ }
+ for(int i=0;i<500;i++){
+   y.gyro_roll_dps=(float)i*0.2f;
+   assert(FlightPID_Step(&b,&y,&ob));
+ }
+ assert(fabsf(a.gyro_deriv_filt[0]-b.gyro_deriv_filt[0])<1.0f);
+ assert(fabsf(a.gyro_deriv_filt[0]-100.0f)<2.0f);
+ assert(FlightPID_SetGains(&baseline));
+ puts("PASS saturation antiwindup and dt-invariant D lowpass");
+}
 int main(void){
- test_runtime_gains(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_mixer();return 0;}
-=======
-int main(void){test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_mixer();return 0;}
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
+ test_rate_integral_near_level(); test_rate_saturation_and_derivative_dt();
+ test_runtime_gains(); test_20261105_ground_log_zero(); test_config_mode();test_protocol();test_arming();test_faults();test_imu_gap();test_same_tick();test_filter();test_acceleration_rejection();test_mixer();return 0;}

@@ -1,22 +1,16 @@
-<<<<<<< HEAD
-PASS runtime PID defaults/bounds/NAN/atomic APPLY
-PASS CH8 CONFIG gate + existing ARM behavior (no midflight CH8 motor cutoff)
-=======
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
+Local regression suite (2026-11-05):
+
+PASS runtime PID defaults, bounds, NAN rejection, atomic apply
+PASS physical CH8 config gate, ARM lock, no midflight CH8 disarm
 PASS all DShot payloads/CRC, SBUS 16-channel decode, RC neutral/low throttle
 PASS ARM edge, failed attempt, normal spin, KILL, no automatic rearm
 PASS SBUS failsafe/timeout/preset, DMA fault, invalid PID, PID time gap
 PASS fresh SPI after >20 ms gap cannot mask stale attitude or rearm
 PASS same-ms sample timestamp retains control without false dropout
 PASS complementary decay equivalence at 1/2 ms for static gyro input
+PASS acceleration norm rejection, slow gravity convergence, safe initialization
 PASS mixer directions, 34,606 saturation cases, invalid input
+PASS CRC16 golden vector, v1 UDP frame+flag, UART request/response wire format
 
-Host GCC + UBSan; mocked HAL. Not an ARM firmware build or flight test.
-<<<<<<< HEAD
-PASS UART control CRC framing, telemetry protocol compatibility, bit11 flag
-Python CLI/telemetry py_compile passed.
-
-STM32 ARM GCC / ESP32 PlatformIO builds: NOT RUN (toolchains unavailable here).
-STM32 physical UART, PID flash save, ROM OTA and flight: NOT VERIFIED.
-=======
->>>>>>> 7834c5139ab3419720ec722b83b541062d6e8a2e
+Test method: host GCC + UBSan with mocked HAL; no ARM GCC/CubeIDE target build,
+physical ESC test, DShot waveform test or flight test was performed.

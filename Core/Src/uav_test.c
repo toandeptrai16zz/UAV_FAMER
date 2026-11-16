@@ -102,10 +102,18 @@ extern UART_HandleTypeDef huart3;
  * qualification of rate feedback/motor torque. Only passive outputs allowed. */
 /* Candidate attitude controller. Gains are initial/unvalidated and require controlled response checks. */
 #define ENABLE_ATTITUDE_PID          1u
-/* Mount trim estimated from paired 0 and 180 degree readings on same floor spot.
- * Measurements are provisional; airframe stability and axis signs are not validated. */
-#define IMU_ROLL_MOUNT_TRIM_DEG     -2.13f
-#define IMU_PITCH_MOUNT_TRIM_DEG    -1.06f
+/* 2026-11-05 re-mounted IMU: static log uav_20261105_114917(1).csv,
+ * props OFF, mean roll=-1.2988, pitch=-2.8103 degrees, 2283 records.
+ * Controller mapping below: roll = -sensor_pitch + PITCH_TRIM;
+ *                            pitch = -sensor_roll + ROLL_TRIM.
+ * Compensate the measured static errors relative to the former mount:
+ * new PITCH_TRIM = -1.06 + 1.2988 ~= +0.24 deg
+ * new ROLL_TRIM  = -2.13 + 2.8103 ~= +0.68 deg.
+ * Valid ONLY if the static test surface represents the intended level plane.
+ * This is a one-off offset, not an in-flight auto-level algorithm; verify the
+ * angle display on a known-level surface before allowing prop-on operation. */
+#define IMU_ROLL_MOUNT_TRIM_DEG      0.68f
+#define IMU_PITCH_MOUNT_TRIM_DEG     0.24f
 /* FLIGHT CANDIDATE BUILD.
  * The bench scanner is compiled out and the pilot ARM state machine is enabled.
  * This does NOT certify motor order/direction or PID tuning: complete the
@@ -165,7 +173,15 @@ extern UART_HandleTypeDef huart3;
 #define PID_ANGLE_LIMIT_DEG          25.0f
 #define PID_YAW_RATE_LIMIT_DPS       90.0f
 #define GYRO_LSB_PER_DPS              65.5f
-#define COMP_FILTER_ALPHA           0.98f
+/* Original 0.98 per 1 ms = ~49.5 ms time constant: accelerometer
+ * transients at high throttle can be mistaken for 10-20 degree tilt.
+ * Use a provisional 0.5 s time constant, and downweight accelerometer
+ * whenever the measured total acceleration differs from ~1g.
+ * MUST be validated on the actual airframe before flight; do not
+ * compensate hardware vibration problems with PID gains. */
+#define COMP_FILTER_TAU_S            0.50f
+#define ACCEL_TRUST_FULL_ERR_G        0.10f
+#define ACCEL_TRUST_ZERO_ERR_G        0.30f
 
 /* [THÊM MỚI] PID Độ cao (Bám ngọn cây) */
 #define ALT_TARGET_CM                100.0f  /* Mục tiêu bay cách ngọn cây 1 mét */
@@ -370,32 +386,77 @@ static float body_roll_rate_dps(void)  { return -gyro_y_rate_dps(); }
 static float body_pitch_rate_dps(void) { return -gyro_x_rate_dps(); }
 static float body_yaw_rate_dps(void)   { return -gyro_z_rate_dps(); }
 
+/* Accelerometer tilt is valid for gravity-dominated motion only.
+ * A large norm departure is evidence of transient translational acceleration
+ * or vibration: preserve the gyro integration and reject that tilt update.
+ * NOTE: norm near 1g does not PROVE absence of non-gravity acceleration. */
+static float accel_tilt_confidence(float ax, float ay, float az)
+{
+    const float norm_g = sqrtf(ax*ax + ay*ay + az*az) / 8192.0f;
+    const float error_g = fabsf(norm_g - 1.0f);
+    if (!isfinite(norm_g)) return 0.0f;
+    if (error_g <= ACCEL_TRUST_FULL_ERR_G) return 1.0f;
+    if (error_g >= ACCEL_TRUST_ZERO_ERR_G) return 0.0f;
+    return (ACCEL_TRUST_ZERO_ERR_G - error_g) /
+           (ACCEL_TRUST_ZERO_ERR_G - ACCEL_TRUST_FULL_ERR_G);
+}
+
 static void update_attitude(uint32_t dt_ms)
 {
-    float dt = (float)dt_ms / 1000.0f;
-    if (dt <= 0.0f) return;
-    float accel_roll = atan2f((float)accel_y, (float)accel_z) * 57.2957795f;
-    float accel_pitch = atan2f(-(float)accel_x,
-                     sqrtf((float)accel_y*(float)accel_y + (float)accel_z*(float)accel_z)) * 57.2957795f;
+    const float dt = (float)dt_ms / 1000.0f;
+    if (dt <= 0.0f || dt > 0.020f) return;
+    const float ax = (float)accel_x, ay = (float)accel_y, az = (float)accel_z;
+    const float confidence = accel_tilt_confidence(ax, ay, az);
+    const float accel_roll = atan2f(ay, az) * 57.2957795f;
+    const float accel_pitch = atan2f(-ax, sqrtf(ay*ay + az*az)) * 57.2957795f;
     if (!attitude_initialized) {
-        sensor_roll_angle = accel_roll; sensor_pitch_angle = accel_pitch;
+        /* Don't initialise attitude from a severe impact or acceleration. */
+        if (confidence < 0.80f) return;
+        sensor_roll_angle = accel_roll;
+        sensor_pitch_angle = accel_pitch;
         attitude_initialized = true;
     }
-    /* Preserve the original 0.98 weight at 1 ms; keep the same decay time
-     * when a sample takes 2..20 ms. This does not reject linear acceleration. */
-    const float alpha = (dt_ms == 1u) ? COMP_FILTER_ALPHA :
-                        powf(COMP_FILTER_ALPHA, (float)dt_ms);
-    sensor_roll_angle = alpha * (sensor_roll_angle + gyro_x_rate_dps()*dt) +
-                        (1.0f-alpha)*accel_roll;
-    sensor_pitch_angle = alpha * (sensor_pitch_angle + gyro_y_rate_dps()*dt) +
-                         (1.0f-alpha)*accel_pitch;
-    /* Floor trim is defined in the ORIGINAL sensor coordinate system.
-     * Convert only after trim so near-horizontal remains near (0,0).
-     * From hand-tilt observations: body Roll = -sensor Pitch; body Pitch = -sensor Roll.
-     * Do not use for unrestricted flight until rate mapping and force directions
-     * have been independently confirmed on the actual airframe. */
-    roll_angle  = -(sensor_pitch_angle - IMU_PITCH_MOUNT_TRIM_DEG);
-    pitch_angle = -(sensor_roll_angle  - IMU_ROLL_MOUNT_TRIM_DEG);
+    /* dt-invariant complementary filter: 0.998 @ 1 ms, ~0.961 @ 20 ms
+     * when acc is trustworthy; accel influence is reduced on vibration. */
+    const float blend = (1.0f - expf(-dt / COMP_FILTER_TAU_S)) * confidence;
+    /* The old filter integrated IMU X/Y independently and ignored body yaw.
+     * That is not an Euler-attitude model: while yawing with nonzero roll,
+     * body-axis pitch rate and pitch Euler rate are DIFFERENT.  The 16-Nov
+     * log measured |yaw|>350 deg/s, so this omission is significant.
+     *
+     * Use the existing, field-checked frame convention:
+     *   roll  = pitch_mount_trim - sensor_pitch
+     *   pitch = roll_mount_trim  - sensor_roll
+     *   p/q/r = body_roll/pitch/yaw_rate_dps(), with +yaw clockwise.
+     * Integrate rigid-body 3-2-1 Euler kinematics in the AIRFRAME axes,
+     * then blend with the existing acceleration-based level reference.
+     * No MPU6500 axis/trim calibration or external telemetry sign changes.
+     * Attitude is used only inside the guarded existing control loop.
+     */
+    const float rad = 0.01745329251994329577f;
+    const float old_roll = IMU_PITCH_MOUNT_TRIM_DEG - sensor_pitch_angle;
+    const float old_pitch = IMU_ROLL_MOUNT_TRIM_DEG - sensor_roll_angle;
+    const float phi = old_roll * rad;
+    const float theta = old_pitch * rad;
+    const float p = body_roll_rate_dps();
+    const float q = body_pitch_rate_dps();
+    const float r = body_yaw_rate_dps();
+    /* Keep tan(theta) bounded if tilt approaches the Euler singularity.
+     * Normal arming already requires <8 degrees of tilt. */
+    const float bounded_pitch = fmaxf(-1.3962634f, fminf(1.3962634f, theta));
+    const float sin_phi = sinf(phi), cos_phi = cosf(phi);
+    const float roll_dot = p + (q * sin_phi + r * cos_phi) * tanf(bounded_pitch);
+    const float pitch_dot = q * cos_phi - r * sin_phi;
+    const float predicted_body_roll = old_roll + roll_dot * dt;
+    const float predicted_body_pitch = old_pitch + pitch_dot * dt;
+    const float acc_body_roll = IMU_PITCH_MOUNT_TRIM_DEG - accel_pitch;
+    const float acc_body_pitch = IMU_ROLL_MOUNT_TRIM_DEG - accel_roll;
+    roll_angle = predicted_body_roll + blend * (acc_body_roll - predicted_body_roll);
+    pitch_angle = predicted_body_pitch + blend * (acc_body_pitch - predicted_body_pitch);
+    /* Preserve sensor-angle semantics for the existing ASCII diagnostics. */
+    sensor_pitch_angle = IMU_PITCH_MOUNT_TRIM_DEG - roll_angle;
+    sensor_roll_angle = IMU_ROLL_MOUNT_TRIM_DEG - pitch_angle;
+    /* Non-finite attitude must still trigger the original motor failsafe. */
 }
 
 #if ENABLE_ATTITUDE_PID
@@ -785,7 +846,20 @@ static void motor_step(void)
                      * Preserve V328 manually observed negative sensor-Z sign. */
                     .gyro_yaw_dps = body_yaw_rate_dps(),
                     .dt_s = (float)dt_ms/1000.0f,
-                    .allow_integrator = armed && spinning
+                    /* A restraint can hold the craft at a false steady angle.
+                     * Integrate ONLY near level, neutral RC, moderate gyro,
+                     * with the motors already spinning. Never wind against
+                     * the cage/tether or a strong transient. */
+                    .reset_integrator = !armed || !spinning,
+                    .allow_integrator = armed && spinning &&
+                        (fabsf(roll_angle) < 6.0f) &&
+                        (fabsf(pitch_angle) < 6.0f) &&
+                        (fabsf(body_roll_rate_dps()) < 35.0f) &&
+                        (fabsf(body_pitch_rate_dps()) < 35.0f) &&
+                        (fabsf(body_yaw_rate_dps()) < 35.0f) &&
+                        (fabsf(RC_StickNormalized(channels[CH_ROLL], RC_ROLL_CENTER)) < 0.02f) &&
+                        (fabsf(RC_StickNormalized(channels[CH_PITCH], RC_PITCH_CENTER)) < 0.02f) &&
+                        (fabsf(RC_StickNormalized(channels[CH_YAW], RC_YAW_CENTER)) < 0.02f)
                 };
                 FlightPIDOutput out;
                 if (FlightPID_Step(&flight_pid, &in, &out)) {
@@ -1191,7 +1265,7 @@ void uav_test_loop(void)
             if (attitude_dt > imu_dt_max_ms) imu_dt_max_ms = attitude_dt;
             if ((attitude_dt > 0u) && (attitude_dt <= IMU_MAX_AGE_MS)) {
                 update_attitude(attitude_dt);
-                imu_control_valid = isfinite(roll_angle) && isfinite(pitch_angle);
+                imu_control_valid = attitude_initialized && isfinite(roll_angle) && isfinite(pitch_angle);
             } else if (attitude_dt > IMU_MAX_AGE_MS) {
                 /* Mark this recovery sample invalid BEFORE motor_step can
                  * observe the newly refreshed SPI timestamp. Reinitialize on
@@ -1276,7 +1350,7 @@ void uav_test_loop(void)
          * Flags 0x04/0x08 and timeout remain independently visible. */
         const uint8_t fs_guard = debug_rf_latched ? debug_rf_guard_reason : fs_reason;
         last_log_ms = now;
-        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu TLM=%lu TLD=%lu\r\n",
+        log_async("V%lu RX=%u L=%u FS=%u F=%02X AGE=%lu PRE=%u LAT=%u A=%u K=%u T=%u RC=%u/%u/%u N=%u S=%ld/%ld R=%ld P=%ld LV=%u G=%ld/%ld/%ld PID=%ld/%ld/%ld MIX=%ld/%ld/%ld/%ld O=%u/%u/%u/%u B=%u M=%u CMD=%u TX=%lu DE=%lu DH=%u LK=%u AR=%u SP=%u CAP=%u YQ=%u BLK=%03X RD=%u MAP=%u LS=%u LOW=%u FL=%u NE=%u IM=%u TZ=%u RAT=%ld BASE=%ld MS=%ld MO=%ld IDT=%lu MDT=%lu LATE=%lu IGAP=%lu IERR=%lu TLM=%lu TLD=%lu RT=%ld/%ld/%ld RE=%ld/%ld/%ld IT=%ld/%ld/%ld\r\n",
                   (unsigned long)(++log_sequence),
                   rx_fresh ? 1u : 0u, debug_link_ok ? 1u : 0u,
                   (unsigned)fs_guard, (unsigned)debug_sbus_flags, (unsigned long)debug_age_ms,
@@ -1317,7 +1391,16 @@ void uav_test_loop(void)
                   (unsigned long)motor_late_count, (unsigned long)imu_gap_count,
                   (unsigned long)imu_read_errors,
                   (unsigned long)UAVTelemetry_GetCompleted(),
-                  (unsigned long)UAVTelemetry_GetDropped());
+                  (unsigned long)UAVTelemetry_GetDropped(),
+                  (long)(flight_pid.rate_set_dps[0] * 10.0f),
+                  (long)(flight_pid.rate_set_dps[1] * 10.0f),
+                  (long)(flight_pid.rate_set_dps[2] * 10.0f),
+                  (long)(flight_pid.rate_error_dps[0] * 10.0f),
+                  (long)(flight_pid.rate_error_dps[1] * 10.0f),
+                  (long)(flight_pid.rate_error_dps[2] * 10.0f),
+                  (long)(flight_pid.pid_i[0] * 10.0f),
+                  (long)(flight_pid.pid_i[1] * 10.0f),
+                  (long)(flight_pid.pid_i[2] * 10.0f));
     }
 
     /* Binary telemetry follows the 1 Hz ASCII status write on the same UART.
